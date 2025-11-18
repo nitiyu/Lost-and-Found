@@ -14,7 +14,8 @@ from google import genai
 from google.genai import types
 
 from langchain_community.vectorstores import PGVector
-from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
+
 
 
 # =======================
@@ -670,5 +671,6 @@ Description: {extract_field(structured_text, 'Description')}
                         json.dumps(final_json),
                     )
                     st.success("Lost item report submitted.")
+
 
 
