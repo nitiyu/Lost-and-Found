@@ -1,5 +1,5 @@
 # =======================
-# LOST AND FOUND INTAKE SYSTEM
+# LOST & FOUND INTAKE SYSTEM
 # =======================
 
 import streamlit as st
@@ -7,11 +7,22 @@ import sqlite3
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
+
 from PIL import Image
 import pandas as pd
+
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError, ClientError
 
+# -----------------------
+# CONFIG
+# -----------------------
+
+DB_PATH = "lost_and_found.db"
+IMAGE_DIR = Path("images")
+IMAGE_DIR.mkdir(exist_ok=True)
 
 # =======================
 # GEMINI CLIENT
@@ -54,7 +65,7 @@ Do not wait for confirmation before giving the first description.
 2. Clarification
 Ask targeted concise follow up questions to collect identifying details such as brand, condition,
 writing, contents, location (station), and time found.
-If the user provides a station name (for example “Times Sq”, “Queensboro Plaza”), try to identify the corresponding subway line or lines.
+If the user provides a station name (for example "Times Sq", "Queensboro Plaza"), try to identify the corresponding subway line or lines.
 If multiple lines serve the station, you can mention all of them. If the station name has four or more lines, record only the station name.
 If the station is unclear or unknown, set Subway Location to null.
 Stop asking questions once the description is clear and specific enough.
@@ -148,7 +159,6 @@ Do not output any explanation. Only output the JSON object.
 # DATA HELPERS
 # =======================
 
-
 @st.cache_data
 def load_tag_data():
     """
@@ -170,7 +180,7 @@ def load_tag_data():
 
 
 def extract_field(text: str, field: str) -> str:
-    """Extract a simple `Field: value` line from a structured block."""
+    """Extract a simple 'Field: value' line from a structured block."""
     match = re.search(rf"{field}:\s*(.*)", text)
     return match.group(1).strip() if match else "null"
 
@@ -203,7 +213,7 @@ def standardize_description(text: str, tags: dict) -> dict:
             model="gemini-1.5-flash",
             contents=full_prompt,
         )
-    except Exception as e:
+    except (APIError, ClientError) as e:
         st.error(f"Error calling Gemini for standardization: {e}")
         return {}
 
@@ -213,38 +223,37 @@ def standardize_description(text: str, tags: dict) -> dict:
         json_end = cleaned.rfind("}") + 1
         json_text = cleaned[json_start:json_end]
         data = json.loads(json_text)
-
-        # Ensure required keys exist and fill time if missing
-        if "time" not in data or not data["time"]:
-            data["time"] = datetime.now(timezone.utc).isoformat()
-
-        # Normalize list type fields
-        for key in ["subway_location", "color", "item_type"]:
-            if key in data and isinstance(data[key], str):
-                data[key] = [data[key]]
-            elif key not in data:
-                data[key] = []
-
-        if "item_category" not in data:
-            data["item_category"] = "null"
-
-        if "description" not in data:
-            data["description"] = extract_field(text, "Description")
-
-        return data
     except Exception:
         st.error("Model output could not be parsed as JSON. Raw output is displayed below.")
         st.text(response.text)
         return {}
+
+    # Ensure required keys exist and fill time if missing
+    if "time" not in data or not data["time"]:
+        data["time"] = datetime.now(timezone.utc).isoformat()
+
+    # Normalize list type fields
+    for key in ["subway_location", "color", "item_type"]:
+        if key in data and isinstance(data[key], str):
+            data[key] = [data[key]]
+        elif key not in data:
+            data[key] = []
+
+    if "item_category" not in data:
+        data["item_category"] = "null"
+
+    if "description" not in data:
+        data["description"] = extract_field(text, "Description")
+
+    return data
 
 
 # =======================
 # DATABASE HELPERS
 # =======================
 
-
 def init_db():
-    with sqlite3.connect("lost_and_found.db") as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -273,7 +282,7 @@ def init_db():
 
 
 def add_found_item(caption, location, contact, image_path, json_data_string):
-    with sqlite3.connect("lost_and_found.db") as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -286,7 +295,7 @@ def add_found_item(caption, location, contact, image_path, json_data_string):
 
 
 def add_lost_item(description, contact, email, json_data_string):
-    with sqlite3.connect("lost_and_found.db") as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -298,12 +307,109 @@ def add_lost_item(description, contact, email, json_data_string):
         conn.commit()
 
 
+def get_all_found_items():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, caption, location, contact, image_path, json_data FROM found_items")
+        rows = c.fetchall()
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "id": row[0],
+                "caption": row[1],
+                "location": row[2],
+                "contact": row[3],
+                "image_path": row[4],
+                "json": json.loads(row[5]) if row[5] else {},
+            }
+        )
+    return items
+
+
+def get_all_lost_items():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, description, contact, email, json_data FROM lost_items")
+        rows = c.fetchall()
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "id": row[0],
+                "description": row[1],
+                "contact": row[2],
+                "email": row[3],
+                "json": json.loads(row[4]) if row[4] else {},
+            }
+        )
+    return items
+
+
 def validate_phone(phone: str) -> bool:
     return bool(re.fullmatch(r"\d{10}", phone))
 
 
 def validate_email(email: str) -> bool:
     return "@" in email and "." in email.split("@")[-1]
+
+
+# =======================
+# MATCHING / RAG HELPERS
+# =======================
+
+def tokenize(text: str):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def jaccard(a: str, b: str) -> float:
+    sa, sb = tokenize(a), tokenize(b)
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union
+
+
+def compute_match_score(lost_json: dict, found_json: dict) -> float:
+    score = 0.0
+
+    # Category
+    if lost_json.get("item_category") and lost_json.get("item_category") == found_json.get("item_category"):
+        score += 3.0
+
+    # Type overlap
+    lost_types = set(lost_json.get("item_type", []))
+    found_types = set(found_json.get("item_type", []))
+    if lost_types and found_types:
+        overlap = lost_types & found_types
+        if overlap:
+            score += 3.0 + len(overlap)
+
+    # Location overlap
+    lost_loc = set(lost_json.get("subway_location", []))
+    found_loc = set(found_json.get("subway_location", []))
+    if lost_loc and found_loc:
+        overlap = lost_loc & found_loc
+        if overlap:
+            score += 2.0 + 0.5 * len(overlap)
+
+    # Color overlap
+    lost_color = set(lost_json.get("color", []))
+    found_color = set(found_json.get("color", []))
+    if lost_color and found_color:
+        overlap = lost_color & found_color
+        if overlap:
+            score += 2.0 + 0.5 * len(overlap)
+
+    # Description similarity
+    desc_sim = jaccard(
+        lost_json.get("description", ""),
+        found_json.get("description", ""),
+    )
+    score += 5.0 * desc_sim
+
+    return score
 
 
 # =======================
@@ -321,9 +427,10 @@ init_db()
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ["Upload Found Item (Operator)", "Report Lost Item (User)"],
+    ["Upload Found Item (Operator)", "Report Lost Item (User)", "Match Lost to Found"],
 )
 
+tag_data = load_tag_data()
 
 # ===============================================================
 # OPERATOR SIDE
@@ -332,7 +439,6 @@ page = st.sidebar.radio(
 if page == "Upload Found Item (Operator)":
     st.title("Operator View: Upload Found Item")
 
-    tag_data = load_tag_data()
     if not tag_data:
         st.stop()
 
@@ -381,9 +487,14 @@ if page == "Upload Found Item (Operator)":
 
                 if uploaded_image:
                     img = Image.open(uploaded_image).convert("RGB")
+                    img_path = IMAGE_DIR / f"found_{datetime.now().timestamp()}.png"
+                    img.save(img_path)
                     st.image(img, width=200)
                     prompt_parts.append(img)
                     message_content += "Image uploaded.\n"
+                    st.session_state.operator_image_path = str(img_path)
+                else:
+                    st.session_state.operator_image_path = ""
 
                 if initial_text:
                     prompt_parts.append(initial_text)
@@ -393,22 +504,30 @@ if page == "Upload Found Item (Operator)":
                     {"role": "user", "content": message_content}
                 )
                 with st.spinner("Analyzing item"):
-                    response = st.session_state.operator_chat.send_message(prompt_parts)
+                    try:
+                        response = st.session_state.operator_chat.send_message(prompt_parts)
+                        reply_text = response.text
+                    except (APIError, ClientError) as e:
+                        reply_text = f"Error from Gemini: {e}"
                 st.session_state.operator_msgs.append(
-                    {"role": "model", "content": response.text}
+                    {"role": "model", "content": reply_text}
                 )
                 st.rerun()
 
     # Continue chat
-    operator_input = st.chat_input("Add more details or say done when ready")
+    operator_input = st.chat_input("Add more details or say 'done' when ready")
     if operator_input:
         st.session_state.operator_msgs.append(
             {"role": "user", "content": operator_input}
         )
         with st.spinner("Processing"):
-            response = st.session_state.operator_chat.send_message(operator_input)
+            try:
+                response = st.session_state.operator_chat.send_message(operator_input)
+                reply_text = response.text
+            except (APIError, ClientError) as e:
+                reply_text = f"Error from Gemini: {e}"
         st.session_state.operator_msgs.append(
-            {"role": "model", "content": response.text}
+            {"role": "model", "content": reply_text}
         )
         st.rerun()
 
@@ -422,7 +541,7 @@ if page == "Upload Found Item (Operator)":
 
         final_json = standardize_description(structured_text, tag_data)
         if final_json:
-            st.success("Standardized JSON")
+            st.success("Standardized JSON for database")
             st.json(final_json)
 
             contact = st.text_input("Operator contact or badge")
@@ -436,7 +555,7 @@ if page == "Upload Found Item (Operator)":
                     final_json.get("description", ""),
                     location_value,
                     contact,
-                    "",
+                    st.session_state.get("operator_image_path", ""),
                     json.dumps(final_json),
                 )
                 st.success("Found item saved to database.")
@@ -446,10 +565,9 @@ if page == "Upload Found Item (Operator)":
 # USER SIDE
 # ===============================================================
 
-if page == "Report Lost Item (User)":
+elif page == "Report Lost Item (User)":
     st.title("User View: Report a Lost Item")
 
-    tag_data = load_tag_data()
     if not tag_data:
         st.stop()
 
@@ -516,27 +634,35 @@ if page == "Report Lost Item (User)":
                 message_text += "Here is an image of my lost item.\n"
             if initial_text:
                 parts.append(initial_text)
-                message_text += message_text + initial_text if not message_text else initial_text
+                message_text += initial_text
 
             st.session_state.user_msgs.append(
                 {"role": "user", "content": message_text}
             )
             with st.spinner("Analyzing"):
-                response = st.session_state.user_chat.send_message(parts)
+                try:
+                    response = st.session_state.user_chat.send_message(parts)
+                    reply_text = response.text
+                except (APIError, ClientError) as e:
+                    reply_text = f"Error from Gemini: {e}"
             st.session_state.user_msgs.append(
-                {"role": "model", "content": response.text}
+                {"role": "model", "content": reply_text}
             )
             st.rerun()
 
-    user_input = st.chat_input("Add more details or say done when ready")
+    user_input = st.chat_input("Add more details or say 'done' when ready")
     if user_input:
         st.session_state.user_msgs.append(
             {"role": "user", "content": user_input}
         )
         with st.spinner("Thinking"):
-            response = st.session_state.user_chat.send_message(user_input)
+            try:
+                response = st.session_state.user_chat.send_message(user_input)
+                reply_text = response.text
+            except (APIError, ClientError) as e:
+                reply_text = f"Error from Gemini: {e}"
         st.session_state.user_msgs.append(
-            {"role": "model", "content": response.text}
+            {"role": "model", "content": reply_text}
         )
         st.rerun()
 
@@ -579,3 +705,53 @@ Description: {extract_field(structured_text, 'Description')}
                         json.dumps(final_json),
                     )
                     st.success("Lost item report submitted.")
+
+
+# ===============================================================
+# MATCHING PAGE (RAG + LLM MATCH STEP)
+# ===============================================================
+
+elif page == "Match Lost to Found":
+    st.title("Match Lost Reports to Found Items")
+
+    lost_items = get_all_lost_items()
+    found_items = get_all_found_items()
+
+    if not lost_items:
+        st.info("No lost item reports in the database yet.")
+        st.stop()
+    if not found_items:
+        st.info("No found items in the database yet.")
+        st.stop()
+
+    lost_options = [
+        f"{item['id']}: {item['json'].get('description', item['description'])[:60]}"
+        for item in lost_items
+    ]
+    chosen = st.selectbox("Select a lost item", lost_options)
+    chosen_id = int(chosen.split(":")[0])
+    lost = next(item for item in lost_items if item["id"] == chosen_id)
+
+    st.subheader("Lost item details")
+    st.json(lost["json"])
+
+    # Compute scores against all found items
+    results = []
+    for found in found_items:
+        score = compute_match_score(lost["json"], found["json"])
+        results.append((score, found))
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    top_n = results[:5]
+
+    st.subheader("Top candidate matches from found items")
+    for score, found in top_n:
+        st.markdown("---")
+        st.markdown(f"**Found Item ID:** {found['id']}  |  **Score:** {score:.2f}")
+        if found["image_path"] and Path(found["image_path"]).exists():
+            st.image(found["image_path"], width=200)
+        st.markdown(f"**Caption:** {found['caption']}")
+        st.markdown(f"**Location:** {found['location']}")
+        st.markdown(f"**Operator contact:** {found['contact']}")
+        st.json(found["json"])
+
