@@ -12,6 +12,7 @@ import pandas as pd
 
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors  # NEW: to catch ClientError
 
 # Optional vector-search imports (wrapped in try so app still runs if missing)
 try:
@@ -71,6 +72,47 @@ def get_gemini_client():
 
 
 gemini_client = get_gemini_client()
+
+
+# =======================
+# SAFE GEMINI HELPERS
+# =======================
+
+def safe_send(chat, message_content: str, context: str = ""):
+    """
+    Wrapper for chat.send_message that shows the real Gemini ClientError
+    instead of the redacted Streamlit traceback.
+    """
+    try:
+        return chat.send_message(message_content)
+    except genai_errors.ClientError as e:
+        label = context or "chat"
+        st.error(f"Gemini ClientError during {label}: {e}")
+        # If there is structured JSON, show it for debugging
+        if getattr(e, "response_json", None):
+            st.json(e.response_json)
+        st.stop()
+
+
+def safe_generate(full_prompt: str, context: str = ""):
+    """
+    Wrapper for gemini_client.models.generate_content with clear error reporting.
+    """
+    if gemini_client is None:
+        st.error("Gemini client is not available.")
+        st.stop()
+
+    try:
+        return gemini_client.models.generate_content(
+            model="gemini-1.5-flash",  # change here if you switch models
+            contents=full_prompt,
+        )
+    except genai_errors.ClientError as e:
+        label = context or "standardization"
+        st.error(f"Gemini ClientError during {label}: {e}")
+        if getattr(e, "response_json", None):
+            st.json(e.response_json)
+        st.stop()
 
 
 # =======================
@@ -265,14 +307,8 @@ def standardize_description(text: str, tags: dict) -> dict:
 
     full_prompt = f"{STANDARDIZER_PROMPT}\n\nHere is the structured input to standardize:\n{text}\n{tags_summary}"
 
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=full_prompt,
-        )
-    except Exception as e:
-        st.error(f"Error calling Gemini for standardization: {e}")
-        return {}
+    # Use safe_generate so we see real errors
+    response = safe_generate(full_prompt, context="standardize_description")
 
     try:
         cleaned = response.text.strip()
@@ -460,9 +496,11 @@ if page == "Upload Found Item (Operator)":
                     {"role": "user", "content": message_content}
                 )
                 with st.spinner("Analyzing item"):
-                    # IMPORTANT: send only text to Gemini
-                    response = st.session_state.operator_chat.send_message(
-                        message_content
+                    # IMPORTANT: send only text to Gemini via safe_send
+                    response = safe_send(
+                        st.session_state.operator_chat,
+                        message_content,
+                        context="operator intake",
                     )
                 st.session_state.operator_msgs.append(
                     {"role": "model", "content": response.text}
@@ -476,7 +514,11 @@ if page == "Upload Found Item (Operator)":
             {"role": "user", "content": operator_input}
         )
         with st.spinner("Processing"):
-            response = st.session_state.operator_chat.send_message(operator_input)
+            response = safe_send(
+                st.session_state.operator_chat,
+                operator_input,
+                context="operator follow-up",
+            )
         st.session_state.operator_msgs.append(
             {"role": "model", "content": response.text}
         )
@@ -593,8 +635,12 @@ if page == "Report Lost Item (User)":
                 {"role": "user", "content": message_text}
             )
             with st.spinner("Analyzing"):
-                # IMPORTANT: send only text to Gemini
-                response = st.session_state.user_chat.send_message(message_text)
+                # IMPORTANT: send only text to Gemini via safe_send
+                response = safe_send(
+                    st.session_state.user_chat,
+                    message_text,
+                    context="user initial report",
+                )
             st.session_state.user_msgs.append(
                 {"role": "model", "content": response.text}
             )
@@ -607,7 +653,11 @@ if page == "Report Lost Item (User)":
             {"role": "user", "content": user_input}
         )
         with st.spinner("Thinking"):
-            response = st.session_state.user_chat.send_message(user_input)
+            response = safe_send(
+                st.session_state.user_chat,
+                user_input,
+                context="user follow-up",
+            )
         st.session_state.user_msgs.append(
             {"role": "model", "content": response.text}
         )
@@ -671,6 +721,8 @@ Description: {extract_field(structured_text, 'Description')}
                             st.markdown("---")
                     except Exception as e:
                         st.error(f"Error during vector search: {e}")
+
+
 
 
 
