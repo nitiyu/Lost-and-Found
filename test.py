@@ -4,6 +4,13 @@
 # =======================
 
 import streamlit as st
+
+st.write("SECRETS LOADED:", st.secrets)
+
+st.write("Has GEMINI_API_KEY:", "GEMINI_API_KEY" in st.secrets)
+st.write("Has OPENAI_API_KEY:", "OPENAI_API_KEY" in st.secrets)
+st.write("Has PG_CONNECTION_STRING:", "PG_CONNECTION_STRING" in st.secrets)
+
 import json
 import re
 from datetime import datetime, timezone
@@ -626,6 +633,7 @@ Description: {extract_field(structured_text, 'Description')}
                                     f"Description: {doc.page_content}\n\n"
                                     f"Metadata: `{doc.metadata}`\n\n"
                                 )
+
 
 
 
