@@ -1,33 +1,56 @@
 # =======================
-# LOST AND FOUND INTAKE SYSTEM
+# LOST & FOUND INTAKE SYSTEM
 # =======================
 
+import streamlit as st
+import sqlite3
 import json
 import re
 from datetime import datetime, timezone
-
-import pandas as pd
-import sqlite3
-import streamlit as st
 from PIL import Image
+import pandas as pd
 
 from google import genai
 from google.genai import types
 
-# Optional: only needed if vector search is enabled
+# Optional vector-search imports (wrapped in try so app still runs if missing)
 try:
     from langchain_community.vectorstores import PGVector
     from langchain_openai import OpenAIEmbeddings
-    LANGCHAIN_AVAILABLE = True
+
+    HAS_VECTOR_LIBS = True
 except Exception:
-    LANGCHAIN_AVAILABLE = False
+    HAS_VECTOR_LIBS = False
 
 
-# -----------------------
-# CONFIG FLAGS
-# -----------------------
+# =======================
+# SECRETS / CONFIG HELPERS
+# =======================
 
-ENABLE_VECTOR_SEARCH = True     # you can set this to False to turn off vector search
+@st.cache_resource
+def get_secrets():
+    """Read secrets and expose simple flags."""
+    try:
+        secrets_dict = st.secrets.to_dict()
+    except Exception:
+        secrets_dict = {}
+
+    gemini_key = secrets_dict.get("GEMINI_API_KEY")
+    openai_key = secrets_dict.get("OPENAI_API_KEY")
+    pg_conn_string = secrets_dict.get("PG_CONNECTION_STRING")
+
+    return {
+        "raw": secrets_dict,
+        "gemini_key": gemini_key,
+        "openai_key": openai_key,
+        "pg_conn_string": pg_conn_string,
+        "has_gemini": gemini_key is not None,
+        "has_openai": openai_key is not None,
+        "has_pg": pg_conn_string is not None,
+    }
+
+
+secrets = get_secrets()
 
 
 # =======================
@@ -36,14 +59,11 @@ ENABLE_VECTOR_SEARCH = True     # you can set this to False to turn off vector s
 
 @st.cache_resource
 def get_gemini_client():
-    try:
-        api_key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
+    if not secrets["has_gemini"]:
         st.error("GEMINI_API_KEY is not set in Streamlit secrets.")
         return None
-
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=secrets["gemini_key"])
         return client
     except Exception as e:
         st.error(f"Error initializing Gemini client: {e}")
@@ -51,6 +71,40 @@ def get_gemini_client():
 
 
 gemini_client = get_gemini_client()
+
+
+# =======================
+# OPTIONAL VECTOR STORE (PGVECTOR + OPENAI)
+# =======================
+
+@st.cache_resource
+def get_vector_store():
+    """
+    Try to connect to existing PGVector store.
+    If any dependency or secret is missing, return None and do not error.
+    """
+    if not HAS_VECTOR_LIBS:
+        return None
+
+    if not (secrets["has_openai"] and secrets["has_pg"]):
+        return None
+
+    try:
+        embeddings = OpenAIEmbeddings(openai_api_key=secrets["openai_key"])
+        db = PGVector(
+            connection_string=secrets["pg_conn_string"],
+            embedding_function=embeddings,
+            collection_name="lostandfound",
+        )
+        # light test query to ensure connection works
+        _ = db.similarity_search("ping", k=1)
+        return db
+    except Exception as e:
+        st.warning(f"Vector search disabled (could not connect to PGVector): {e}")
+        return None
+
+
+vector_store = get_vector_store()
 
 
 # =======================
@@ -164,15 +218,12 @@ Do not output any explanation. Only output the JSON object.
 
 
 # =======================
-# TAG DATA HELPERS
+# DATA HELPERS
 # =======================
 
 @st.cache_data
 def load_tag_data():
-    """
-    Load Tags.xlsx and prepare tag lists.
-    Expected columns: Subway Location, Color, Item Category, Item Type.
-    """
+    """Load Tags.xlsx and prepare tag lists."""
     try:
         df = pd.read_excel("Tags.xlsx")
         return {
@@ -183,7 +234,7 @@ def load_tag_data():
             "item_types": sorted(set(df["Item Type"].dropna().astype(str))),
         }
     except Exception as e:
-        st.error(f"Error loading tag data: {e}")
+        st.error(f"Error loading tag data (Tags.xlsx): {e}")
         return None
 
 
@@ -199,9 +250,7 @@ def is_structured_record(message: str) -> bool:
 
 
 def standardize_description(text: str, tags: dict) -> dict:
-    """
-    Send structured text and tag data summary to Gemini for JSON standardization.
-    """
+    """Send structured text plus tag summary to Gemini and parse JSON."""
     if gemini_client is None:
         st.error("Gemini client is not available. Cannot standardize description.")
         return {}
@@ -232,11 +281,11 @@ def standardize_description(text: str, tags: dict) -> dict:
         json_text = cleaned[json_start:json_end]
         data = json.loads(json_text)
 
-        # Fill time if missing
+        # Fill missing time
         if "time" not in data or not data["time"]:
             data["time"] = datetime.now(timezone.utc).isoformat()
 
-        # Normalize list fields
+        # Normalize list-type fields
         for key in ["subway_location", "color", "item_type"]:
             if key in data and isinstance(data[key], str):
                 data[key] = [data[key]]
@@ -251,13 +300,13 @@ def standardize_description(text: str, tags: dict) -> dict:
 
         return data
     except Exception:
-        st.error("Model output could not be parsed as JSON. Raw output is displayed below.")
+        st.error("Model output could not be parsed as JSON. Raw output below:")
         st.text(response.text)
         return {}
 
 
 # =======================
-# SQLITE DATABASE HELPERS
+# DATABASE HELPERS (SQLite for metadata)
 # =======================
 
 def init_db():
@@ -296,7 +345,7 @@ def add_found_item(caption, location, contact, image_path, json_data_string):
             """
             INSERT INTO found_items (caption, location, contact, image_path, json_data)
             VALUES (?, ?, ?, ?, ?)
-        """,
+            """,
             (caption, location, contact, image_path, json_data_string),
         )
         conn.commit()
@@ -309,7 +358,7 @@ def add_lost_item(description, contact, email, json_data_string):
             """
             INSERT INTO lost_items (description, contact, email, json_data)
             VALUES (?, ?, ?, ?)
-        """,
+            """,
             (description, contact, email, json_data_string),
         )
         conn.commit()
@@ -324,88 +373,7 @@ def validate_email(email: str) -> bool:
 
 
 # =======================
-# POSTGRES AND VECTOR SEARCH HELPERS
-# =======================
-
-@st.cache_resource
-def get_pg_sql_connection():
-    """
-    Use Streamlit's st.connection with [connections.postgresql] from secrets.toml.
-    """
-    try:
-        conn = st.connection("postgresql", type="sql")
-        return conn
-    except Exception as e:
-        st.warning(f"Could not initialize PostgreSQL connection: {e}")
-        return None
-
-
-@st.cache_resource
-def get_vector_store():
-    """
-    Build a PGVector store using OPENAI embeddings and the same connection as st.connection.
-    """
-    if not ENABLE_VECTOR_SEARCH:
-        return None
-
-    if not LANGCHAIN_AVAILABLE:
-        st.warning("LangChain or OpenAI embeddings not installed. Vector search is disabled.")
-        return None
-
-    # OpenAI key from secrets
-    try:
-        _ = st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        st.warning("OPENAI_API_KEY not found in secrets. Vector search is disabled.")
-        return None
-
-    sql_conn = get_pg_sql_connection()
-    if sql_conn is None:
-        return None
-
-    # st.connection("postgresql", type="sql") exposes an SQLAlchemy engine as _instance.engine
-    engine = sql_conn._instance.engine
-    connection_url = str(engine.url)
-
-    try:
-        embeddings = OpenAIEmbeddings()  # uses OPENAI_API_KEY from environment/secrets
-        store = PGVector(
-            collection_name="lostandfound",
-            connection_string=connection_url,
-            embedding_function=embeddings,
-        )
-        return store
-    except Exception as e:
-        st.warning(f"Error initializing PGVector (vector search disabled): {e}")
-        return None
-
-
-def search_similar_items(query_text: str, k: int = 5):
-    store = get_vector_store()
-    if store is None:
-        st.info("Vector search not available.")
-        return
-
-    try:
-        results = store.similarity_search(query_text, k=k)
-    except Exception as e:
-        st.warning(f"Error during vector search: {e}")
-        return
-
-    if not results:
-        st.write("No similar items found.")
-        return
-
-    st.write("Similar items from vector store:")
-    for i, doc in enumerate(results, start=1):
-        st.markdown(f"**Result {i}**")
-        st.write(doc.page_content)
-        if doc.metadata:
-            st.json(doc.metadata)
-
-
-# =======================
-# STREAMLIT APP
+# STREAMLIT SETUP
 # =======================
 
 st.set_page_config(
@@ -422,12 +390,6 @@ page = st.sidebar.radio(
     ["Upload Found Item (Operator)", "Report Lost Item (User)"],
 )
 
-# optional quick vector search tool in sidebar
-with st.sidebar.expander("Vector search (debug)"):
-    q = st.text_input("Search similar descriptions")
-    if q:
-        search_similar_items(q)
-
 
 # ===============================================================
 # OPERATOR SIDE
@@ -441,9 +403,10 @@ if page == "Upload Found Item (Operator)":
         st.stop()
 
     if gemini_client is None:
-        st.info("Gemini is not available. You can still use manual fields but automated description will not run.")
+        st.info("Gemini is not available. Automated description is disabled.")
         st.stop()
 
+    # Start operator chat if needed
     if "operator_chat" not in st.session_state:
         st.session_state.operator_chat = gemini_client.chats.create(
             model="gemini-1.5-flash",
@@ -480,31 +443,34 @@ if page == "Upload Found Item (Operator)":
             if not uploaded_image and not initial_text:
                 st.error("Please upload an image or enter a short description.")
             else:
-                prompt_parts = []
                 message_content = ""
 
                 if uploaded_image:
                     img = Image.open(uploaded_image).convert("RGB")
                     st.image(img, width=200)
-                    prompt_parts.append(img)
-                    message_content += "Image uploaded.\n"
+                    message_content += (
+                        "I have a photo of the found item. "
+                        "Here is my description based on what I see: "
+                    )
 
                 if initial_text:
-                    prompt_parts.append(initial_text)
                     message_content += initial_text
 
                 st.session_state.operator_msgs.append(
                     {"role": "user", "content": message_content}
                 )
                 with st.spinner("Analyzing item"):
-                    response = st.session_state.operator_chat.send_message(prompt_parts)
+                    # IMPORTANT: send only text to Gemini
+                    response = st.session_state.operator_chat.send_message(
+                        message_content
+                    )
                 st.session_state.operator_msgs.append(
                     {"role": "model", "content": response.text}
                 )
                 st.rerun()
 
     # Continue chat
-    operator_input = st.chat_input("Add more details or say done when ready")
+    operator_input = st.chat_input("Add more details or say 'done' when ready")
     if operator_input:
         st.session_state.operator_msgs.append(
             {"role": "user", "content": operator_input}
@@ -543,7 +509,7 @@ if page == "Upload Found Item (Operator)":
                     "",
                     json.dumps(final_json),
                 )
-                st.success("Found item saved to local SQLite database.")
+                st.success("Found item saved to database.")
 
 
 # ===============================================================
@@ -551,14 +517,14 @@ if page == "Upload Found Item (Operator)":
 # ===============================================================
 
 if page == "Report Lost Item (User)":
-    st.title("User View: Report a Lost Item")
+    st.title("Report Lost Item (User)")
 
     tag_data = load_tag_data()
     if not tag_data:
         st.stop()
 
     if gemini_client is None:
-        st.info("Gemini is not available. You can still submit details manually, but auto structuring will not run.")
+        st.info("Gemini is not available. Automated structuring is disabled.")
         st.stop()
 
     st.markdown("You can give quick info using dropdowns, then refine with chat.")
@@ -579,6 +545,7 @@ if page == "Report Lost Item (User)":
             )
 
     st.subheader("Describe or show your lost item")
+
     col_img, col_text = st.columns(2)
     with col_img:
         uploaded_image = st.file_uploader(
@@ -593,6 +560,7 @@ if page == "Report Lost Item (User)":
             key="user_text",
         )
 
+    # Start user chat if needed
     if "user_chat" not in st.session_state:
         st.session_state.user_chat = gemini_client.chats.create(
             model="gemini-1.5-flash",
@@ -607,32 +575,33 @@ if page == "Report Lost Item (User)":
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    # Start report
     if not st.session_state.user_msgs and st.button("Start Report"):
         if not uploaded_image and not initial_text:
             st.error("Please upload an image or enter a short description.")
         else:
-            parts = []
             message_text = ""
             if uploaded_image:
                 image = Image.open(uploaded_image).convert("RGB")
                 st.image(image, width=250)
-                parts.append(image)
-                message_text += "Here is an image of my lost item.\n"
+                message_text += "I have uploaded an image of my lost item. "
+
             if initial_text:
-                parts.append(initial_text)
                 message_text += initial_text
 
             st.session_state.user_msgs.append(
                 {"role": "user", "content": message_text}
             )
             with st.spinner("Analyzing"):
-                response = st.session_state.user_chat.send_message(parts)
+                # IMPORTANT: send only text to Gemini
+                response = st.session_state.user_chat.send_message(message_text)
             st.session_state.user_msgs.append(
                 {"role": "model", "content": response.text}
             )
             st.rerun()
 
-    user_input = st.chat_input("Add more details or say done when ready")
+    # Continue chat
+    user_input = st.chat_input("Add more details or say 'done' when ready")
     if user_input:
         st.session_state.user_msgs.append(
             {"role": "user", "content": user_input}
@@ -682,7 +651,27 @@ Description: {extract_field(structured_text, 'Description')}
                         email,
                         json.dumps(final_json),
                     )
-                    st.success("Lost item report submitted to local SQLite database.")
+                    st.success("Lost item report submitted.")
+
+    # Optional vector search debug panel
+    with st.expander("Vector search (debug)"):
+        if vector_store is None:
+            st.info("Vector search is not configured or not available.")
+        else:
+            query = st.text_input("Search similar descriptions")
+            if query:
+                with st.spinner("Searching similar items"):
+                    try:
+                        results = vector_store.similarity_search_with_score(
+                            query, k=3
+                        )
+                        for doc, score in results:
+                            st.write(f"Score: {score:.4f}")
+                            st.write(doc.page_content)
+                            st.markdown("---")
+                    except Exception as e:
+                        st.error(f"Error during vector search: {e}")
+
 
 
 
