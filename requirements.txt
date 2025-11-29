@@ -1,10 +1,8 @@
 streamlit
-openpyxl
 google-genai
-pandas
-Pillow
-sqlalchemy
-psycopg2-binary
-langchain-community
 langchain-openai
-pgvector
+langchain-chroma
+chromadb==0.5.3
+pandas
+pillow
+python-dotenv
