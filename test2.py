@@ -1,14 +1,14 @@
 # =======================
-# LOST & FOUND INTAKE SYSTEM (PostgreSQL + PGVector)
+# LOST & FOUND INTAKE SYSTEM (PostgreSQL + pgvector)
 # =======================
 
-import streamlit as st
 import json
 import re
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, List, Any
 
 import pandas as pd
+import streamlit as st
 from PIL import Image
 
 from google import genai
@@ -18,7 +18,6 @@ from google.genai import errors as genai_errors
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from langchain_community.vectorstores import PGVector
 from langchain_openai import OpenAIEmbeddings
 
 
@@ -40,7 +39,7 @@ st.set_page_config(
 # -----------------------
 
 @st.cache_resource
-def get_secrets():
+def get_secrets() -> Dict[str, Any]:
     try:
         s = st.secrets.to_dict()
     except Exception:
@@ -89,29 +88,19 @@ engine = get_engine()
 
 
 @st.cache_resource
-def get_vector_store():
-    """
-    Connect to PGVector in PostgreSQL for text embeddings.
-    Returns None if anything is missing.
-    """
-    if not (secrets["openai_key"] and secrets["pg_conn_string"]):
+def get_embedder():
+    """OpenAI embedder used to generate vectors stored in PostgreSQL."""
+    if not secrets["openai_key"]:
+        st.warning("OPENAI_API_KEY is not set; semantic matching will be disabled.")
         return None
     try:
-        embeddings = OpenAIEmbeddings(openai_api_key=secrets["openai_key"])
-        vs = PGVector(
-            connection_string=secrets["pg_conn_string"],
-            embedding_function=embeddings,
-            collection_name="lostandfound",  # your collection name
-        )
-        # quick ping
-        _ = vs.similarity_search("ping", k=1)
-        return vs
+        return OpenAIEmbeddings(openai_api_key=secrets["openai_key"])
     except Exception as e:
-        st.warning(f"Vector search disabled (PGVector error): {e}")
+        st.warning(f"Error creating OpenAI embedder: {e}")
         return None
 
 
-vector_store = get_vector_store()
+embedder = get_embedder()
 
 
 # -----------------------
@@ -279,9 +268,9 @@ def load_tag_data():
         return None
 
 
-def extract_field(text: str, field: str) -> str:
+def extract_field(text_block: str, field: str) -> str:
     """Extract 'Field: value' from a structured block."""
-    match = re.search(rf"{field}:\s*(.*)", text)
+    match = re.search(rf"{field}:\s*(.*)", text_block)
     return match.group(1).strip() if match else "null"
 
 
@@ -289,7 +278,7 @@ def is_structured_record(message: str) -> bool:
     return message.strip().startswith("Subway Location:")
 
 
-def standardize_description(text: str, tags: Dict) -> Dict:
+def standardize_description(text_block: str, tags: Dict) -> Dict:
     """Send structured text + tag summary to Gemini and parse JSON."""
     tags_summary = (
         "\n--- TAGS REFERENCE ---\n"
@@ -299,7 +288,7 @@ def standardize_description(text: str, tags: Dict) -> Dict:
         f"Item Type tags: {', '.join(tags['item_types'][:50])}\n"
     )
 
-    full_prompt = f"{STANDARDIZER_PROMPT}\n\nHere is the structured input to standardize:\n{text}\n{tags_summary}"
+    full_prompt = f"{STANDARDIZER_PROMPT}\n\nHere is the structured input to standardize:\n{text_block}\n{tags_summary}"
 
     response = safe_generate(full_prompt, context="standardize_description")
 
@@ -325,7 +314,7 @@ def standardize_description(text: str, tags: Dict) -> Dict:
             data["item_category"] = "null"
 
         if "description" not in data:
-            data["description"] = extract_field(text, "Description")
+            data["description"] = extract_field(text_block, "Description")
 
         return data
 
@@ -340,10 +329,13 @@ def standardize_description(text: str, tags: Dict) -> Dict:
 # -----------------------
 
 def init_db():
-    """Create found_items and lost_items tables in PostgreSQL if not exist."""
+    """Create extension + found_items and lost_items tables in PostgreSQL."""
     if engine is None:
         return
 
+    create_extension = "CREATE EXTENSION IF NOT EXISTS vector;"
+
+    # 1536 matches text-embedding-3-small / ada-002
     create_found = """
     CREATE TABLE IF NOT EXISTS found_items (
         id SERIAL PRIMARY KEY,
@@ -354,7 +346,8 @@ def init_db():
         description TEXT,
         contact TEXT,
         image_path TEXT,
-        json_data JSONB
+        json_data JSONB,
+        embedding VECTOR(1536)
     );
     """
 
@@ -364,14 +357,24 @@ def init_db():
         description TEXT,
         contact TEXT,
         email TEXT,
-        json_data JSONB
+        json_data JSONB,
+        embedding VECTOR(1536)
     );
+    """
+
+    create_idx = """
+    CREATE INDEX IF NOT EXISTS idx_found_items_embedding
+    ON found_items
+    USING ivfflat (embedding vector_l2_ops)
+    WITH (lists = 100);
     """
 
     try:
         with engine.begin() as conn:
+            conn.execute(text(create_extension))
             conn.execute(text(create_found))
             conn.execute(text(create_lost))
+            conn.execute(text(create_idx))
     except SQLAlchemyError as e:
         st.error(f"Error initializing PostgreSQL tables: {e}")
 
@@ -420,20 +423,21 @@ def add_found_item(json_data: Dict, contact: str, image_path: str = "") -> int:
         return -1
 
 
-def add_lost_item(description: str, contact: str, email: str, json_data_string: str):
-    """Insert lost item in PostgreSQL."""
+def add_lost_item(description: str, contact: str, email: str, json_data_string: str) -> int:
+    """Insert lost item in PostgreSQL and return new id."""
     if engine is None:
         st.error("PostgreSQL engine is not available.")
-        return
+        return -1
 
     sql = """
     INSERT INTO lost_items (description, contact, email, json_data)
-    VALUES (:description, :contact, :email, :json_data);
+    VALUES (:description, :contact, :email, :json_data)
+    RETURNING id;
     """
 
     try:
         with engine.begin() as conn:
-            conn.execute(
+            result = conn.execute(
                 text(sql),
                 {
                     "description": description,
@@ -442,8 +446,11 @@ def add_lost_item(description: str, contact: str, email: str, json_data_string: 
                     "json_data": json_data_string,
                 },
             )
+            new_id = result.scalar()
+            return new_id if new_id is not None else -1
     except SQLAlchemyError as e:
         st.error(f"Error inserting lost item: {e}")
+        return -1
 
 
 def validate_phone(phone: str) -> bool:
@@ -455,33 +462,101 @@ def validate_email(email: str) -> bool:
 
 
 # -----------------------
-# VECTOR STORE HELPER
+# EMBEDDING + MATCHING HELPERS (PostgreSQL + pgvector)
 # -----------------------
 
-def add_found_embedding(item_id: int, json_data: Dict, image_path: str = ""):
-    """Add a found item into PGVector (if configured)."""
-    if vector_store is None or item_id <= 0:
-        return
+def _vec_to_pgvector(vec: List[float]) -> str:
+    """Convert Python list[float] to pgvector literal string."""
+    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
-    text_value = json_data.get("description", "")
-    metadata = {
-        "found_id": item_id,
-        "subway_location": json_data.get("subway_location", []),
-        "color": json_data.get("color", []),
-        "item_category": json_data.get("item_category", ""),
-        "item_type": json_data.get("item_type", []),
-        "image_path": image_path,
-        "description": text_value,
-    }
+
+def add_found_embedding(item_id: int, description: str):
+    """Compute embedding and store in found_items.embedding."""
+    if embedder is None or engine is None or item_id <= 0 or not description:
+        return
+    try:
+        vec = embedder.embed_query(description)
+        vec_str = _vec_to_pgvector(vec)
+        sql = "UPDATE found_items SET embedding = :emb::vector WHERE id = :id"
+        with engine.begin() as conn:
+            conn.execute(text(sql), {"emb": vec_str, "id": item_id})
+    except Exception as e:
+        st.warning(f"Could not store embedding for found item {item_id}: {e}")
+
+
+def add_lost_embedding(lost_id: int, description: str):
+    """Compute embedding and store in lost_items.embedding."""
+    if embedder is None or engine is None or lost_id <= 0 or not description:
+        return
+    try:
+        vec = embedder.embed_query(description)
+        vec_str = _vec_to_pgvector(vec)
+        sql = "UPDATE lost_items SET embedding = :emb::vector WHERE id = :id"
+        with engine.begin() as conn:
+            conn.execute(text(sql), {"emb": vec_str, "id": lost_id})
+    except Exception as e:
+        st.warning(f"Could not store embedding for lost item {lost_id}: {e}")
+
+
+def find_matches_for_lost_item(final_json: Dict, top_k: int = 3):
+    """
+    Use pgvector directly:
+    - build a query embedding from the lost item's description
+    - rank found_items by embedding distance
+    - optionally filter by category / color
+    """
+    if embedder is None or engine is None:
+        return []
+
+    desc = final_json.get("description", "")
+    if not desc:
+        return []
+
+    vec = embedder.embed_query(desc)
+    vec_str = _vec_to_pgvector(vec)
+
+    filters = ["embedding IS NOT NULL"]
+    params: Dict[str, Any] = {"emb": vec_str, "k": top_k}
+
+    category = final_json.get("item_category")
+    if category and category != "null":
+        filters.append("item_category = :category")
+        params["category"] = category
+
+    colors = final_json.get("color") or []
+    if colors:
+        color_clauses = []
+        for i, c in enumerate(colors):
+            key = f"c{i}"
+            color_clauses.append(f"color ILIKE :{key}")
+            params[key] = f"%{c}%"
+        filters.append("(" + " OR ".join(color_clauses) + ")")
+
+    where_sql = "WHERE " + " AND ".join(filters)
+
+    sql = f"""
+    SELECT
+        id,
+        description,
+        image_path,
+        subway_location,
+        color,
+        item_category,
+        item_type,
+        (embedding <-> :emb::vector) AS distance
+    FROM found_items
+    {where_sql}
+    ORDER BY embedding <-> :emb::vector
+    LIMIT :k;
+    """
 
     try:
-        vector_store.add_texts(
-            texts=[text_value],
-            metadatas=[metadata],
-            ids=[str(item_id)],
-        )
+        with engine.begin() as conn:
+            rows = conn.execute(text(sql), params).fetchall()
+        return rows
     except Exception as e:
-        st.warning(f"Could not add embedding to vector store: {e}")
+        st.error(f"Error running match query: {e}")
+        return []
 
 
 # -----------------------
@@ -598,11 +673,11 @@ if page == "Upload Found Item (Operator)":
             st.json(final_json)
 
             contact = st.text_input("Operator contact or badge")
-            # This version does not persist images to disk; image_path left blank
+            # In this version, we don't persist images to disk; image_path left blank
             if st.button("Save Found Item"):
                 item_id = add_found_item(final_json, contact, image_path="")
-                add_found_embedding(item_id, final_json, image_path="")
-                st.success("Found item saved (PostgreSQL + PGVector).")
+                add_found_embedding(item_id, final_json.get("description", ""))
+                st.success("Found item saved (PostgreSQL + pgvector).")
 
 
 # ===============================================================
@@ -734,53 +809,47 @@ Description: {extract_field(structured_text, 'Description')}
                 elif not validate_email(email):
                     st.error("Please enter a valid email address.")
                 else:
-                    # Save lost item in PostgreSQL
-                    add_lost_item(
-                        final_json.get("description", ""),
+                    desc = final_json.get("description", "")
+
+                    # Save lost item
+                    lost_id = add_lost_item(
+                        desc,
                         contact,
                         email,
                         json.dumps(final_json),
                     )
+                    add_lost_embedding(lost_id, desc)
                     st.success("Lost item report submitted.")
 
-                    # Vector search for matches
-                    if vector_store is None:
-                        st.info(
-                            "Vector search is not configured, so no matches can be shown yet."
-                        )
-                    else:
-                        query_text = final_json.get("description", "")
-                        # simple filter on item_category if present
-                        filters = {}
-                        if final_json.get("item_category") and final_json[
-                            "item_category"
-                        ] != "null":
-                            filters["item_category"] = final_json["item_category"]
+                    # PostgreSQL matching with pgvector
+                    with st.spinner("Searching for similar found items in PostgreSQL..."):
+                        matches = find_matches_for_lost_item(final_json, top_k=3)
 
-                        with st.spinner(
-                            "Searching for similar found items using embeddings..."
-                        ):
-                            try:
-                                docs_scores = vector_store.similarity_search_with_score(
-                                    query_text,
-                                    k=3,
-                                    filter=filters or None,
-                                )
-                            except Exception as e:
-                                st.error(f"Error during vector search: {e}")
-                                docs_scores = []
+                    if matches:
+                        st.subheader("Top candidate matches")
+                        for row in matches:
+                            (
+                                found_id,
+                                f_desc,
+                                f_image_path,
+                                f_loc,
+                                f_color,
+                                f_cat,
+                                f_type,
+                                distance,
+                            ) = row
 
-                        if docs_scores:
-                            st.subheader("Top candidate matches")
-                            for doc, score in docs_scores:
-                                meta = doc.metadata or {}
-                                st.markdown(f"**Score:** `{score:.4f}`")
-                                st.write(meta.get("description", doc.page_content))
-                                if meta.get("image_path"):
-                                    st.image(meta["image_path"], width=200)
-                                st.write(meta)
-                                st.markdown("---")
-                        else:
-                            st.info(
-                                "No close matches found in the vector store for this description yet."
+                            st.markdown(
+                                f"**Found item ID:** `{found_id}`  —  distance: `{distance:.4f}`"
                             )
+                            st.write(f_desc)
+                            st.write(f"Location: {f_loc}")
+                            st.write(f"Color: {f_color}")
+                            st.write(f"Category: {f_cat}")
+                            st.write(f"Type: {f_type}")
+                            if f_image_path:
+                                st.image(f_image_path, width=200)
+                            st.markdown("---")
+                    else:
+                        st.info("No close matches found in PostgreSQL yet.")
+
