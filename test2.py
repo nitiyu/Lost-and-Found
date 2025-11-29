@@ -1,8 +1,11 @@
+# =======================
+# LOST & FOUND INTAKE SYSTEM (Chroma Vector DB)
+# =======================
+
 import json
 import re
 from datetime import datetime, timezone
-from typing import Dict, Any
-from uuid import uuid4
+from typing import Dict, Any, List
 
 import pandas as pd
 import streamlit as st
@@ -13,8 +16,12 @@ from google.genai import types
 from google.genai import errors as genai_errors
 
 from langchain_openai import OpenAIEmbeddings
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import Chroma
 
+
+# -----------------------
+# BASIC CONFIG
+# -----------------------
 
 MODEL_NAME = "gemini-2.0-flash"
 
@@ -24,12 +31,14 @@ st.set_page_config(
     layout="wide",
 )
 
+
 # -----------------------
-# SECRETS
+# SECRETS / CLIENTS / VECTOR STORE
 # -----------------------
 
 @st.cache_resource
-def get_secrets():
+def get_secrets() -> Dict[str, Any]:
+    """Load API keys and config from Streamlit secrets."""
     try:
         s = st.secrets.to_dict()
     except Exception:
@@ -40,15 +49,13 @@ def get_secrets():
         "openai_key": s.get("OPENAI_API_KEY"),
     }
 
+
 secrets = get_secrets()
 
 
-# -----------------------
-# GEMINI CLIENT
-# -----------------------
-
 @st.cache_resource
 def get_gemini_client():
+    """Initialize Gemini client."""
     if not secrets["gemini_key"]:
         st.error("GEMINI_API_KEY is not set in Streamlit secrets.")
         return None
@@ -58,30 +65,32 @@ def get_gemini_client():
         st.error(f"Error initializing Gemini client: {e}")
         return None
 
+
 gemini_client = get_gemini_client()
 
 
-# -----------------------
-# CHROMA VECTOR STORE
-# -----------------------
-
 @st.cache_resource
 def get_vector_store():
-    """Local Chroma DB for found items."""
+    """
+    Create or load a Chroma vector DB using OpenAI embeddings.
+    This stores all *found* items with metadata.
+    """
     if not secrets["openai_key"]:
         st.warning("OPENAI_API_KEY is not set; semantic matching will be disabled.")
         return None
+
     try:
         embeddings = OpenAIEmbeddings(openai_api_key=secrets["openai_key"])
         vs = Chroma(
-            collection_name="lost_and_found",
+            collection_name="lost_and_found_items",
             embedding_function=embeddings,
-            persist_directory="chroma_db",  # folder in your repo
+            persist_directory="chroma_db",  # local folder for persistence
         )
         return vs
     except Exception as e:
-        st.warning(f"Error creating vector store: {e}")
+        st.error(f"Error creating Chroma vector store: {e}")
         return None
+
 
 vector_store = get_vector_store()
 
@@ -91,6 +100,7 @@ vector_store = get_vector_store()
 # -----------------------
 
 def safe_send(chat, message_content: str, context: str = ""):
+    """Wrapper around chat.send_message with clear error reporting."""
     try:
         return chat.send_message(message_content)
     except genai_errors.ClientError as e:
@@ -102,6 +112,7 @@ def safe_send(chat, message_content: str, context: str = ""):
 
 
 def safe_generate(full_prompt: str, context: str = ""):
+    """Wrapper around generate_content with clear error reporting."""
     if gemini_client is None:
         st.error("Gemini client is not available.")
         st.stop()
@@ -229,13 +240,14 @@ Do not output any explanation. Only output the JSON object.
 
 
 # -----------------------
-# TAGS + SMALL HELPERS
+# TAG / DATA HELPERS
 # -----------------------
 
 @st.cache_data
 def load_tag_data():
+    """Load Tags.xlsx and prepare tag lists."""
     try:
-        df = pd.read_excel("Tags.xlsx")
+        df = pd.read_excel("Tags.xlsx")  # requires openpyxl
         return {
             "df": df,
             "locations": sorted(set(df["Subway Location"].dropna().astype(str))),
@@ -247,21 +259,20 @@ def load_tag_data():
         st.error(f"Error loading tag data (Tags.xlsx): {e}")
         return None
 
-tag_data = load_tag_data()
-if not tag_data or gemini_client is None:
-    st.stop()
-
 
 def extract_field(text_block: str, field: str) -> str:
+    """Extract 'Field: value' from a structured block."""
     match = re.search(rf"{field}:\s*(.*)", text_block)
     return match.group(1).strip() if match else "null"
 
 
 def is_structured_record(message: str) -> bool:
+    """Detect if a message is the final structured record."""
     return message.strip().startswith("Subway Location:")
 
 
 def standardize_description(text_block: str, tags: Dict) -> Dict:
+    """Send structured text + tag summary to Gemini and parse JSON."""
     tags_summary = (
         "\n--- TAGS REFERENCE ---\n"
         f"Subway Location tags: {', '.join(tags['locations'][:50])}\n"
@@ -271,6 +282,7 @@ def standardize_description(text_block: str, tags: Dict) -> Dict:
     )
 
     full_prompt = f"{STANDARDIZER_PROMPT}\n\nHere is the structured input to standardize:\n{text_block}\n{tags_summary}"
+
     response = safe_generate(full_prompt, context="standardize_description")
 
     try:
@@ -280,9 +292,11 @@ def standardize_description(text_block: str, tags: Dict) -> Dict:
         json_text = cleaned[json_start:json_end]
         data = json.loads(json_text)
 
+        # Fill missing time
         if "time" not in data or not data["time"]:
             data["time"] = datetime.now(timezone.utc).isoformat()
 
+        # Normalize lists
         for key in ["subway_location", "color", "item_type"]:
             if key in data and isinstance(data[key], str):
                 data[key] = [data[key]]
@@ -303,6 +317,10 @@ def standardize_description(text_block: str, tags: Dict) -> Dict:
         return {}
 
 
+# -----------------------
+# SIMPLE VALIDATION HELPERS
+# -----------------------
+
 def validate_phone(phone: str) -> bool:
     return bool(re.fullmatch(r"\d{10}", phone))
 
@@ -311,36 +329,65 @@ def validate_email(email: str) -> bool:
     return "@" in email and "." in email.split("@")[-1]
 
 
-# ------------- VECTOR STORE OPERATIONS ------------- #
+# -----------------------
+# VECTOR STORE HELPERS
+# -----------------------
 
-def save_found_to_vectorstore(final_json: Dict, contact: str, image_path: str = ""):
+def get_next_found_id() -> int:
+    """Generate a simple incremental ID for found items (for display/admin)."""
+    if "next_found_id" not in st.session_state:
+        st.session_state.next_found_id = 1
+    nid = st.session_state.next_found_id
+    st.session_state.next_found_id += 1
+    return nid
+
+
+def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
+    """
+    Add a found item into Chroma vector DB with metadata.
+    Returns a local numeric ID.
+    """
     if vector_store is None:
-        return
-    text_value = final_json.get("description", "")
-    if not text_value:
-        return
+        st.error("Vector store is not available; cannot save found item.")
+        return -1
 
-    doc_id = f"found-{uuid4()}"
+    description = json_data.get("description", "")
+    if not description:
+        st.error("Found item description is empty; cannot embed.")
+        return -1
+
+    found_id = get_next_found_id()
+
     metadata = {
-        "id": doc_id,
-        "subway_location": final_json.get("subway_location", []),
-        "color": final_json.get("color", []),
-        "item_category": final_json.get("item_category", ""),
-        "item_type": final_json.get("item_type", []),
+        "record_type": "found",
+        "found_id": found_id,
+        "subway_location": json_data.get("subway_location", []),
+        "color": json_data.get("color", []),
+        "item_category": json_data.get("item_category", ""),
+        "item_type": json_data.get("item_type", []),
+        "description": description,
         "contact": contact,
-        "image_path": image_path,
-        "json_data": final_json,
+        "time": json_data.get("time"),
     }
 
-    vector_store.add_texts(
-        texts=[text_value],
-        metadatas=[metadata],
-        ids=[doc_id],
-    )
-    vector_store.persist()
+    try:
+        vector_store.add_texts(
+            texts=[description],
+            metadatas=[metadata],
+            ids=[str(found_id)],
+        )
+        vector_store.persist()
+        return found_id
+    except Exception as e:
+        st.error(f"Error saving found item to vector store: {e}")
+        return -1
 
 
-def find_matches_in_vectorstore(final_json: Dict, top_k: int = 3):
+def search_matches_for_lost_item(final_json: Dict, top_k: int, max_distance: float):
+    """
+    Use vector DB (Chroma) to search for similar found items.
+    Assumes similarity_search_with_score returns distance (lower is better).
+    """
     if vector_store is None:
         return []
 
@@ -348,32 +395,94 @@ def find_matches_in_vectorstore(final_json: Dict, top_k: int = 3):
     if not query_text:
         return []
 
-    # Simple metadata filter: category only (Chroma filter syntax is strict equality)
-    _filter = None
+    # Optional filter by category
+    filter_dict: Dict[str, Any] = {"record_type": "found"}
     if final_json.get("item_category") and final_json["item_category"] != "null":
-        _filter = {"item_category": final_json["item_category"]}
+        filter_dict["item_category"] = final_json["item_category"]
 
     try:
         docs_scores = vector_store.similarity_search_with_score(
             query_text,
             k=top_k,
-            filter=_filter,
+            filter=filter_dict,
         )
-        return docs_scores
     except Exception as e:
         st.error(f"Error during vector search: {e}")
-        return []
+        docs_scores = []
+
+    # Apply distance threshold
+    filtered = [
+        (doc, score) for doc, score in docs_scores if score <= max_distance
+    ]
+
+    return docs_scores, filtered
+
+
+def get_all_found_items_as_df() -> pd.DataFrame:
+    """
+    Pull all "found" items from Chroma for admin view.
+    """
+    if vector_store is None:
+        return pd.DataFrame()
+
+    try:
+        coll = vector_store._collection  # underlying chroma collection
+        data = coll.get()  # ids, documents, metadatas
+    except Exception as e:
+        st.error(f"Error reading from vector store: {e}")
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    ids = data.get("ids", [])
+    docs = data.get("documents", [])
+    metas = data.get("metadatas", [])
+
+    for id_, doc, meta in zip(ids, docs, metas):
+        if not meta:
+            continue
+        if meta.get("record_type") != "found":
+            continue
+
+        rows.append(
+            {
+                "found_id": meta.get("found_id", id_),
+                "description": meta.get("description", doc),
+                "subway_location": ", ".join(meta.get("subway_location", [])),
+                "color": ", ".join(meta.get("color", [])),
+                "item_category": meta.get("item_category", ""),
+                "item_type": ", ".join(meta.get("item_type", [])),
+                "contact": meta.get("contact", ""),
+                "time": meta.get("time", ""),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
 
 
 # -----------------------
-# APP NAV
+# APP INIT
 # -----------------------
+
+tag_data = load_tag_data()
+if not tag_data:
+    st.stop()
+
+if gemini_client is None:
+    st.stop()
 
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ["Upload Found Item (Operator)", "Report Lost Item (User)"],
+    [
+        "Upload Found Item (Operator)",
+        "Report Lost Item (User)",
+        "Admin: View Found Items",
+    ],
 )
+
 
 # ===============================================================
 # OPERATOR SIDE
@@ -391,10 +500,12 @@ if page == "Upload Found Item (Operator)":
         )
         st.session_state.operator_msgs = []
 
+    # Show conversation history
     for msg in st.session_state.operator_msgs:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    # Initial intake
     if not st.session_state.operator_msgs:
         col1, col2 = st.columns(2)
         with col1:
@@ -436,6 +547,7 @@ if page == "Upload Found Item (Operator)":
                 )
                 st.rerun()
 
+    # Continue chat
     operator_input = st.chat_input("Add more details or say 'done' when ready")
     if operator_input:
         st.session_state.operator_msgs.append(
@@ -452,6 +564,7 @@ if page == "Upload Found Item (Operator)":
         )
         st.rerun()
 
+    # When final structured record appears
     if st.session_state.operator_msgs and is_structured_record(
         st.session_state.operator_msgs[-1]["content"]
     ):
@@ -465,9 +578,11 @@ if page == "Upload Found Item (Operator)":
             st.json(final_json)
 
             contact = st.text_input("Operator contact or badge")
-            if st.button("Save Found Item to VectorDB"):
-                save_found_to_vectorstore(final_json, contact, image_path="")
-                st.success("Found item saved to Chroma vector DB.")
+
+            if st.button("Save Found Item to Vector DB"):
+                found_id = save_found_item_to_vectorstore(final_json, contact)
+                if found_id > 0:
+                    st.success(f"Found item saved with ID `{found_id}` (Chroma).")
 
 
 # ===============================================================
@@ -518,10 +633,12 @@ if page == "Report Lost Item (User)":
         )
         st.session_state.user_msgs = []
 
+    # Show chat history
     for msg in st.session_state.user_msgs:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    # Start report
     if not st.session_state.user_msgs and st.button("Start Report"):
         if not uploaded_image and not initial_text:
             st.error("Please upload an image or enter a short description.")
@@ -548,6 +665,7 @@ if page == "Report Lost Item (User)":
             )
             st.rerun()
 
+    # Continue chat
     user_input = st.chat_input("Add more details or say 'done' when ready")
     if user_input:
         st.session_state.user_msgs.append(
@@ -564,6 +682,7 @@ if page == "Report Lost Item (User)":
         )
         st.rerun()
 
+    # When final structured record appears
     if st.session_state.user_msgs and is_structured_record(
         st.session_state.user_msgs[-1]["content"]
     ):
@@ -589,31 +708,102 @@ Description: {extract_field(structured_text, 'Description')}
             contact = st.text_input("Phone number, ten digits")
             email = st.text_input("Email address")
 
-            if st.button("Submit Lost Item Report & Find Matches"):
+            st.markdown("### Matching options")
+            top_k = st.slider(
+                "Number of candidate matches to retrieve (top-K)",
+                min_value=1,
+                max_value=10,
+                value=5,
+                step=1,
+            )
+            max_distance = st.slider(
+                "Maximum distance (lower = more similar)",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.4,
+                step=0.01,
+                help="Matches with distance greater than this will be hidden.",
+            )
+
+            if st.button("Submit Lost Item & Find Matches"):
                 if not validate_phone(contact):
                     st.error("Please enter a ten digit phone number (no spaces).")
                 elif not validate_email(email):
                     st.error("Please enter a valid email address.")
                 else:
-                    # we’re not storing lost items anywhere persistent in this version,
-                    # just using the description as a query against vector DB
-                    st.success("Lost item report submitted (not stored, only used for matching).")
+                    st.success("Lost item report submitted (not stored in DB).")
 
-                    with st.spinner("Searching for similar found items in VectorDB..."):
-                        matches = find_matches_in_vectorstore(final_json, top_k=3)
-
-                    if matches:
-                        st.subheader("Top candidate matches")
-                        for doc, score in matches:
-                            meta = doc.metadata or {}
-                            st.markdown(f"**Score:** `{score:.4f}`")
-                            st.write(meta.get("json_data", {}).get("description", doc.page_content))
-                            st.write(f"Location: {meta.get('subway_location')}")
-                            st.write(f"Color: {meta.get('color')}")
-                            st.write(f"Category: {meta.get('item_category')}")
-                            st.write(f"Type: {meta.get('item_type')}")
-                            if meta.get("image_path"):
-                                st.image(meta["image_path"], width=200)
-                            st.markdown("---")
+                    if vector_store is None:
+                        st.info(
+                            "Vector store is not configured, so no matches can be shown yet."
+                        )
                     else:
-                        st.info("No close matches found in the vector DB yet.")
+                        with st.spinner(
+                            "Searching for similar found items using embeddings..."
+                        ):
+                            all_candidates, filtered = search_matches_for_lost_item(
+                                final_json, top_k=top_k, max_distance=max_distance
+                            )
+
+                        if not all_candidates:
+                            st.info(
+                                "No items are stored in the vector DB yet, so no matches can be returned."
+                            )
+                        else:
+                            st.subheader("Top candidate matches")
+
+                            if not filtered:
+                                st.info(
+                                    "No matches under the current distance threshold. "
+                                    "Showing raw top-K candidates instead."
+                                )
+                                to_show = all_candidates
+                            else:
+                                to_show = filtered
+
+                            for doc, score in to_show:
+                                meta = doc.metadata or {}
+                                similarity_pct = max(0.0, (1.0 - score) * 100.0)
+
+                                st.markdown(
+                                    f"**Distance:** `{score:.4f}`  |  "
+                                    f"**Similarity (approx):** `{similarity_pct:.1f}%`"
+                                )
+
+                                st.write(meta.get("description", doc.page_content))
+
+                                if meta.get("subway_location"):
+                                    st.write(
+                                        f"Location: {', '.join(meta['subway_location'])}"
+                                    )
+                                if meta.get("color"):
+                                    st.write(
+                                        f"Color: {', '.join(meta['color'])}"
+                                    )
+                                if meta.get("item_category"):
+                                    st.write(f"Category: {meta['item_category']}")
+                                if meta.get("item_type"):
+                                    st.write(
+                                        f"Type: {', '.join(meta['item_type'])}"
+                                    )
+
+                                st.json(meta)
+                                st.markdown("---")
+
+
+# ===============================================================
+# ADMIN / DATABASE VIEW
+# ===============================================================
+
+if page == "Admin: View Found Items":
+    st.title("Admin: View Stored Found Items (Chroma)")
+
+    if vector_store is None:
+        st.error("Vector store is not available.")
+    else:
+        df_found = get_all_found_items_as_df()
+        if df_found.empty:
+            st.info("No found items stored yet.")
+        else:
+            st.dataframe(df_found, use_container_width=True)
+
