@@ -26,9 +26,64 @@ from langchain_community.vectorstores import Chroma
 MODEL_NAME = "gemini-2.0-flash"
 
 st.set_page_config(
-    page_title="Lost & Found Intake",
+    page_title="Lost & Found AI",
     page_icon="🧳",
     layout="wide",
+)
+
+# Small CSS polish
+st.markdown(
+    """
+<style>
+/* overall background */
+.main {
+    background-color: #F3F4F6;
+}
+
+/* cards for matches / panels */
+.card {
+    border-radius: 16px;
+    padding: 1rem 1.2rem;
+    border: 1px solid #E5E7EB;
+    background-color: #FFFFFF;
+    margin-bottom: 0.75rem;
+}
+
+/* card title */
+.card-title {
+    font-weight: 600;
+    font-size: 0.98rem;
+    margin-bottom: 0.25rem;
+}
+
+/* subtle text */
+.card-subtle {
+    font-size: 0.8rem;
+    color: #6B7280;
+}
+
+/* badges for tags */
+.badge {
+    display: inline-block;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    background-color: #EEF2FF;
+    border: 1px solid #E0E7FF;
+    font-size: 0.72rem;
+    color: #4F46E5;
+    margin-right: 0.25rem;
+    margin-top: 0.15rem;
+}
+
+/* section titles */
+.section-title {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+}
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
 
@@ -464,23 +519,23 @@ if not tag_data:
 if gemini_client is None:
     st.stop()
 
-st.sidebar.title("Navigation")
+st.sidebar.title("Lost & Found AI")
 page = st.sidebar.radio(
-    "Go to",
+    "View",
     [
-        "Upload Found Item (Operator)",
         "Report Lost Item (User)",
-        "Admin: View Found Items",
+        "Upload Found Item (Staff)",
+        "Admin: Inventory",
     ],
 )
 
 
 # ===============================================================
-# OPERATOR SIDE
+# STAFF INTAKE
 # ===============================================================
 
-if page == "Upload Found Item (Operator)":
-    st.title("Operator View: Upload Found Item")
+if page == "Upload Found Item (Staff)":
+    st.title("Staff Intake – Upload Found Item")
 
     if "operator_chat" not in st.session_state:
         st.session_state.operator_chat = gemini_client.chats.create(
@@ -491,307 +546,357 @@ if page == "Upload Found Item (Operator)":
         )
         st.session_state.operator_msgs = []
 
-    # Show conversation history
-    for msg in st.session_state.operator_msgs:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    # left/right layout
+    left, right = st.columns([3, 2])
 
-    # Initial intake
-    if not st.session_state.operator_msgs:
-        col1, col2 = st.columns(2)
-        with col1:
-            uploaded_image = st.file_uploader(
-                "Image of the found item (optional)",
-                type=["jpg", "jpeg", "png"],
-                key="operator_image",
+    with left:
+        st.markdown('<div class="section-title">Describe the found item</div>',
+                    unsafe_allow_html=True)
+
+        for msg in st.session_state.operator_msgs:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # Initial intake
+        if not st.session_state.operator_msgs:
+            col1, col2 = st.columns(2)
+            with col1:
+                uploaded_image = st.file_uploader(
+                    "Image (optional)",
+                    type=["jpg", "jpeg", "png"],
+                    key="operator_image",
+                )
+            with col2:
+                initial_text = st.text_input(
+                    "Short description",
+                    placeholder="For example: black backpack with a NASA patch",
+                    key="operator_text",
+                )
+
+            if st.button("Start Intake"):
+                if not uploaded_image and not initial_text:
+                    st.error("Please upload an image or enter a short description.")
+                else:
+                    message_content = ""
+                    if uploaded_image:
+                        img = Image.open(uploaded_image).convert("RGB")
+                        st.image(img, width=220)
+                        message_content += "I have uploaded an image of the found item. "
+                    if initial_text:
+                        message_content += initial_text
+
+                    st.session_state.operator_msgs.append(
+                        {"role": "user", "content": message_content}
+                    )
+                    with st.spinner("Analyzing item"):
+                        response = safe_send(
+                            st.session_state.operator_chat,
+                            message_content,
+                            context="operator intake",
+                        )
+                    st.session_state.operator_msgs.append(
+                        {"role": "model", "content": response.text}
+                    )
+                    st.rerun()
+
+        # Continue chat
+        operator_input = st.chat_input("Add more details or say 'done' when ready")
+        if operator_input:
+            st.session_state.operator_msgs.append(
+                {"role": "user", "content": operator_input}
             )
-        with col2:
+            with st.spinner("Processing"):
+                response = safe_send(
+                    st.session_state.operator_chat,
+                    operator_input,
+                    context="operator follow-up",
+                )
+            st.session_state.operator_msgs.append(
+                {"role": "model", "content": response.text}
+            )
+            st.rerun()
+
+    with right:
+        st.markdown('<div class="section-title">Standardized record</div>',
+                    unsafe_allow_html=True)
+
+        if st.session_state.operator_msgs and is_structured_record(
+            st.session_state.operator_msgs[-1]["content"]
+        ):
+            structured_text = st.session_state.operator_msgs[-1]["content"]
+            st.code(structured_text)
+
+            final_json = standardize_description(structured_text, tag_data)
+            if final_json:
+                st.json(final_json)
+
+                contact = st.text_input("Operator contact / badge")
+
+                if st.button("Save to inventory"):
+                    found_id = save_found_item_to_vectorstore(final_json, contact)
+                    if found_id > 0:
+                        st.success(f"Saved as inventory ID `{found_id}`")
+
+
+# ===============================================================
+# USER SIDE – CHAT + MATCHING NAV
+# ===============================================================
+
+if page == "Report Lost Item (User)":
+    st.title("Lost & Found AI — Demo")
+
+    # reset button (top-right)
+    reset_col, _ = st.columns([1, 4])
+    with reset_col:
+        if st.button("Reset session"):
+            for key in [
+                "user_chat",
+                "user_msgs",
+                "lost_final_json",
+                "lost_matches",
+                "match_threshold",
+            ]:
+                st.session_state.pop(key, None)
+            st.experimental_rerun()
+
+    # initial states
+    if "match_threshold" not in st.session_state:
+        st.session_state.match_threshold = 20  # percent
+    if "lost_matches" not in st.session_state:
+        st.session_state.lost_matches = []
+    if "lost_final_json" not in st.session_state:
+        st.session_state.lost_final_json = None
+
+    left, right = st.columns([3, 2])
+
+    # ------------- LEFT: chat panel -------------
+    with left:
+        st.markdown('<div class="section-title">Describe Your Lost Item</div>',
+                    unsafe_allow_html=True)
+
+        # optional quick info
+        with st.expander("Quick tags (optional)"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                location_choice = st.selectbox(
+                    "Subway station", [""] + tag_data["locations"]
+                )
+            with col2:
+                category_choice = st.selectbox(
+                    "Item category", [""] + tag_data["categories"]
+                )
+            with col3:
+                type_choice = st.selectbox(
+                    "Item type", [""] + tag_data["item_types"]
+                )
+
+        # image + short text
+        col_img, col_text = st.columns(2)
+        with col_img:
+            uploaded_image = st.file_uploader(
+                "Photo (optional)",
+                type=["jpg", "jpeg", "png"],
+                key="user_image",
+            )
+        with col_text:
             initial_text = st.text_input(
                 "Short description",
-                placeholder="For example: black backpack with a NASA patch",
-                key="operator_text",
+                placeholder="For example: blue iPhone with cracked screen",
+                key="user_text",
             )
 
-        if st.button("Start Intake"):
+        # chat state
+        if "user_chat" not in st.session_state:
+            st.session_state.user_chat = gemini_client.chats.create(
+                model=MODEL_NAME,
+                config=types.GenerateContentConfig(
+                    system_instruction=USER_SIDE_GENERATOR_PROMPT,
+                ),
+            )
+            st.session_state.user_msgs = []
+
+        # show history
+        for msg in st.session_state.user_msgs:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # Start report
+        if not st.session_state.user_msgs and st.button("Start"):
             if not uploaded_image and not initial_text:
                 st.error("Please upload an image or enter a short description.")
             else:
-                message_content = ""
+                message_text = ""
                 if uploaded_image:
-                    img = Image.open(uploaded_image).convert("RGB")
-                    st.image(img, width=200)
-                    message_content += "I have uploaded an image of the found item. "
+                    image = Image.open(uploaded_image).convert("RGB")
+                    st.image(image, width=230)
+                    message_text += "I have uploaded an image of my lost item. "
                 if initial_text:
-                    message_content += initial_text
+                    message_text += initial_text
 
-                st.session_state.operator_msgs.append(
-                    {"role": "user", "content": message_content}
+                st.session_state.user_msgs.append(
+                    {"role": "user", "content": message_text}
                 )
-                with st.spinner("Analyzing item"):
+                with st.spinner("Analyzing your item..."):
                     response = safe_send(
-                        st.session_state.operator_chat,
-                        message_content,
-                        context="operator intake",
+                        st.session_state.user_chat,
+                        message_text,
+                        context="user initial report",
                     )
-                st.session_state.operator_msgs.append(
+                st.session_state.user_msgs.append(
                     {"role": "model", "content": response.text}
                 )
                 st.rerun()
 
-    # Continue chat
-    operator_input = st.chat_input("Add more details or say 'done' when ready")
-    if operator_input:
-        st.session_state.operator_msgs.append(
-            {"role": "user", "content": operator_input}
-        )
-        with st.spinner("Processing"):
-            response = safe_send(
-                st.session_state.operator_chat,
-                operator_input,
-                context="operator follow-up",
-            )
-        st.session_state.operator_msgs.append(
-            {"role": "model", "content": response.text}
-        )
-        st.rerun()
-
-    # When final structured record appears
-    if st.session_state.operator_msgs and is_structured_record(
-        st.session_state.operator_msgs[-1]["content"]
-    ):
-        structured_text = st.session_state.operator_msgs[-1]["content"]
-        st.markdown("### Final structured description")
-        st.code(structured_text)
-
-        final_json = standardize_description(structured_text, tag_data)
-        if final_json:
-            st.success("Standardized JSON")
-            st.json(final_json)
-
-            contact = st.text_input("Operator contact or badge")
-
-            if st.button("Save Found Item to Vector DB"):
-                found_id = save_found_item_to_vectorstore(final_json, contact)
-                if found_id > 0:
-                    st.success(f"Found item saved with ID `{found_id}` (Chroma).")
-
-
-# ===============================================================
-# USER SIDE
-# ===============================================================
-
-if page == "Report Lost Item (User)":
-    st.title("Report Lost Item (User)")
-
-    st.markdown("You can give quick info using dropdowns, then refine with chat.")
-
-    with st.expander("Optional quick info"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            location_choice = st.selectbox(
-                "Subway station (optional)", [""] + tag_data["locations"]
-            )
-        with col2:
-            category_choice = st.selectbox(
-                "Item category (optional)", [""] + tag_data["categories"]
-            )
-        with col3:
-            type_choice = st.selectbox(
-                "Item type (optional)", [""] + tag_data["item_types"]
-            )
-
-    st.subheader("Describe or show your lost item")
-    col_img, col_text = st.columns(2)
-    with col_img:
-        uploaded_image = st.file_uploader(
-            "Image of lost item (optional)",
-            type=["jpg", "jpeg", "png"],
-            key="user_image",
-        )
-    with col_text:
-        initial_text = st.text_input(
-            "Short description",
-            placeholder="For example: blue iPhone with cracked screen",
-            key="user_text",
-        )
-
-    if "user_chat" not in st.session_state:
-        st.session_state.user_chat = gemini_client.chats.create(
-            model=MODEL_NAME,
-            config=types.GenerateContentConfig(
-                system_instruction=USER_SIDE_GENERATOR_PROMPT,
-            ),
-        )
-        st.session_state.user_msgs = []
-
-    # Show chat history
-    for msg in st.session_state.user_msgs:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    # Start report
-    if not st.session_state.user_msgs and st.button("Start Report"):
-        if not uploaded_image and not initial_text:
-            st.error("Please upload an image or enter a short description.")
-        else:
-            message_text = ""
-            if uploaded_image:
-                image = Image.open(uploaded_image).convert("RGB")
-                st.image(image, width=250)
-                message_text += "I have uploaded an image of my lost item. "
-            if initial_text:
-                message_text += initial_text
-
+        # continue chat
+        user_input = st.chat_input("Answer questions here or say 'done' when ready")
+        if user_input:
             st.session_state.user_msgs.append(
-                {"role": "user", "content": message_text}
+                {"role": "user", "content": user_input}
             )
-            with st.spinner("Analyzing"):
+            with st.spinner("Thinking..."):
                 response = safe_send(
                     st.session_state.user_chat,
-                    message_text,
-                    context="user initial report",
+                    user_input,
+                    context="user follow-up",
                 )
             st.session_state.user_msgs.append(
                 {"role": "model", "content": response.text}
             )
             st.rerun()
 
-    # Continue chat
-    user_input = st.chat_input("Add more details or say 'done' when ready")
-    if user_input:
-        st.session_state.user_msgs.append(
-            {"role": "user", "content": user_input}
-        )
-        with st.spinner("Thinking"):
-            response = safe_send(
-                st.session_state.user_chat,
-                user_input,
-                context="user follow-up",
-            )
-        st.session_state.user_msgs.append(
-            {"role": "model", "content": response.text}
-        )
-        st.rerun()
+        # build final JSON + trigger search
+        if st.session_state.user_msgs and is_structured_record(
+            st.session_state.user_msgs[-1]["content"]
+        ):
+            structured_text = st.session_state.user_msgs[-1]["content"]
 
-    # When final structured record appears
-    if st.session_state.user_msgs and is_structured_record(
-        st.session_state.user_msgs[-1]["content"]
-    ):
-        structured_text = st.session_state.user_msgs[-1]["content"]
-
-        merged_text = f"""
+            merged_text = f"""
 Subway Location: {location_choice or extract_field(structured_text, 'Subway Location')}
 Color: {extract_field(structured_text, 'Color')}
 Item Category: {category_choice or extract_field(structured_text, 'Item Category')}
 Item Type: {type_choice or extract_field(structured_text, 'Item Type')}
 Description: {extract_field(structured_text, 'Description')}
-        """
+            """
 
-        st.markdown("### Final merged record before standardization")
-        st.code(merged_text)
+            st.markdown("##### Final record (before tag standardization)")
+            st.code(merged_text)
 
-        final_json = standardize_description(merged_text, tag_data)
-        if final_json:
-            st.success("Standardized record")
-            st.json(final_json)
+            final_json = standardize_description(merged_text, tag_data)
+            if final_json:
+                st.session_state.lost_final_json = final_json
 
-            st.markdown("### Contact information")
-            contact = st.text_input("Phone number, ten digits")
-            email = st.text_input("Email address")
+                with st.expander("Standardized tags", expanded=False):
+                    st.json(final_json)
 
-            st.markdown("### Matching options")
-            top_k = st.slider(
-                "Number of candidate matches to retrieve (top-K)",
-                min_value=1,
-                max_value=10,
-                value=5,
-                step=1,
-            )
-            match_threshold = st.slider(
-                "Match threshold (approx. similarity, %)",
-                min_value=0,
-                max_value=100,
-                value=60,
-                step=5,
-                help="Only show matches with similarity at or above this percentage.",
-            )
+                st.markdown("##### Contact (for staff to reach you)")
+                contact = st.text_input("Phone number, ten digits")
+                email = st.text_input("Email address")
 
-            if st.button("Submit Lost Item & Find Matches"):
-                if not validate_phone(contact):
-                    st.error("Please enter a ten digit phone number (no spaces).")
-                elif not validate_email(email):
-                    st.error("Please enter a valid email address.")
-                else:
-                    st.success("Lost item report submitted (not stored in DB).")
+                st.markdown("##### Matching settings")
+                top_k = st.slider(
+                    "How many candidate items to retrieve (top-K)?",
+                    min_value=1,
+                    max_value=10,
+                    value=5,
+                )
 
-                    if vector_store is None:
-                        st.info(
-                            "Vector store is not configured, so no matches can be shown yet."
-                        )
+                if st.button("Find matches"):
+                    if not validate_phone(contact):
+                        st.error("Please enter a ten digit phone number (no spaces).")
+                    elif not validate_email(email):
+                        st.error("Please enter a valid email address.")
                     else:
-                        with st.spinner(
-                            "Searching for similar found items using embeddings..."
-                        ):
-                            docs_scores = search_matches_for_lost_item(
-                                final_json, top_k=top_k
-                            )
-
-                        if not docs_scores:
+                        if vector_store is None:
                             st.info(
-                                "No items are stored in the vector DB yet, so no matches can be returned."
+                                "Vector store is not configured, so no matches can be shown yet."
                             )
+                            st.session_state.lost_matches = []
                         else:
-                            st.subheader("Top candidate matches")
-
-                            shown_any = False
-                            for doc, score in docs_scores:
-                                meta = doc.metadata or {}
-                                # Chroma returns a distance; roughly convert to similarity [0,1]
-                                similarity = max(0.0, 1.0 - float(score))
-                                similarity_pct = similarity * 100.0
-
-                                if similarity_pct < match_threshold:
-                                    continue
-
-                                shown_any = True
-                                st.markdown(
-                                    f"**Distance:** `{score:.4f}`  |  "
-                                    f"**Similarity (approx):** `{similarity_pct:.1f}%`"
+                            with st.spinner("Searching inventory for similar items..."):
+                                matches = search_matches_for_lost_item(
+                                    final_json, top_k=top_k
                                 )
+                            st.session_state.lost_matches = matches
+                            st.success("Search complete! Adjust the match slider on the right.")
 
-                                st.write(meta.get("description", doc.page_content))
 
-                                if meta.get("subway_location"):
-                                    st.write(
-                                        "Location: "
-                                        + ", ".join(meta["subway_location"])
-                                    )
-                                if meta.get("color"):
-                                    st.write(
-                                        "Color: " + ", ".join(meta["color"])
-                                    )
-                                if meta.get("item_category"):
-                                    st.write(f"Category: {meta['item_category']}")
-                                if meta.get("item_type"):
-                                    st.write(
-                                        "Type: " + ", ".join(meta["item_type"])
-                                    )
+    # ------------- RIGHT: match threshold + results -------------
+    with right:
+        st.markdown('<div class="section-title">Match threshold</div>',
+                    unsafe_allow_html=True)
 
-                                st.json(meta)
-                                st.markdown("---")
+        st.session_state.match_threshold = st.slider(
+            "",
+            min_value=0,
+            max_value=100,
+            value=st.session_state.match_threshold,
+            step=5,
+            format="%d%%",
+            help="Only show matches at or above this similarity.",
+        )
 
-                            if not shown_any:
-                                st.info(
-                                    "No matches above the current similarity threshold. Try lowering it."
-                                )
+        st.markdown('<div class="section-title" style="margin-top:0.5rem;">Top Matches</div>',
+                    unsafe_allow_html=True)
+
+        matches = st.session_state.lost_matches or []
+
+        if not matches:
+            st.write("No matches above threshold.")
+        else:
+            shown_any = False
+            thr = st.session_state.match_threshold
+
+            for doc, score in matches:
+                meta = doc.metadata or {}
+                distance = float(score)
+                similarity = max(0.0, 1.0 - distance)
+                similarity_pct = similarity * 100.0
+
+                if similarity_pct < thr:
+                    continue
+
+                shown_any = True
+
+                title = meta.get("description", doc.page_content)[:90] + "…"
+                loc = ", ".join(meta.get("subway_location", []))
+                color = ", ".join(meta.get("color", []))
+                cat = meta.get("item_category", "")
+                types = ", ".join(meta.get("item_type", []))
+
+                st.markdown(
+                    f"""
+<div class="card">
+  <div class="card-title">{title}</div>
+  <div class="card-subtle">
+    Distance: <code>{distance:.4f}</code> ·
+    Approx. similarity: <b>{similarity_pct:.1f}%</b>
+  </div>
+  <div style="margin-top:0.4rem;">
+    {"".join(
+        f'<span class="badge">{b}</span>'
+        for b in [
+            f"location: {loc}" if loc else "",
+            f"color: {color}" if color else "",
+            f"category: {cat}" if cat else "",
+            f"type: {types}" if types else "",
+        ] if b
+    )}
+  </div>
+</div>
+""",
+                    unsafe_allow_html=True,
+                )
+
+            if not shown_any:
+                st.write("No matches above the current threshold — try lowering it.")
 
 
 # ===============================================================
-# ADMIN / DATABASE VIEW
+# ADMIN / INVENTORY VIEW
 # ===============================================================
 
-if page == "Admin: View Found Items":
-    st.title("Admin: View Stored Found Items (Chroma)")
+if page == "Admin: Inventory":
+    st.title("Inventory – Stored Found Items")
 
     if vector_store is None:
         st.error("Vector store is not available.")
