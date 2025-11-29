@@ -6,3 +6,4 @@ chromadb==0.5.3
 pandas
 pillow
 python-dotenv
+openpyxl
