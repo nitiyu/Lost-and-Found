@@ -7,6 +7,7 @@ import streamlit as st
 import chromadb
 from chromadb.config import Settings
 from langchain_openai import OpenAIEmbeddings
+from openai import OpenAI
 
 # =========================
 # BASIC CONFIG
@@ -49,6 +50,17 @@ def get_embedder():
 
 
 @st.cache_resource
+def get_openai_client():
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        st.error(f"Error creating OpenAI client: {e}")
+        return None
+
+
+@st.cache_resource
 def get_chroma_collection():
     """
     Persistent Chroma collection stored in ./chroma_db
@@ -65,6 +77,7 @@ def get_chroma_collection():
 
 
 embedder = get_embedder()
+openai_client = get_openai_client()
 collection = get_chroma_collection()
 
 # =========================
@@ -86,9 +99,13 @@ def save_inventory(items: List[Dict[str, Any]]):
         json.dump(items, f, indent=2)
 
 
-# keep inventory in session for quick access
 if "inventory" not in st.session_state:
     st.session_state.inventory = load_inventory()
+
+# store caption from photo
+if "photo_caption" not in st.session_state:
+    st.session_state.photo_caption = ""
+
 
 # =========================
 # EMBEDDING HELPERS
@@ -124,7 +141,6 @@ def index_item_in_chroma(item: Dict[str, Any]):
     if not embedding:
         return
 
-    # upsert in case it already exists
     collection.upsert(
         ids=[doc_id],
         embeddings=[embedding],
@@ -135,12 +151,10 @@ def index_item_in_chroma(item: Dict[str, Any]):
 
 def rebuild_chroma_from_inventory():
     """
-    Optional helper if you ever want to rebuild the DB from scratch.
-    Not called automatically, but you can call from a dev button.
+    Dev helper: rebuild index from current inventory.
     """
     if not embedder or not collection:
         return
-    # clear and re-index
     collection.delete(where={})
     for item in st.session_state.inventory:
         index_item_in_chroma(item)
@@ -169,21 +183,19 @@ def find_matches(query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
 
     matches = []
     for meta, dist in zip(metadatas, distances):
-        # cosine distance in [0,2]; convert to similarity ~ [0,1]
-        similarity = max(0.0, 1.0 - dist)
+        similarity = max(0.0, 1.0 - float(dist))  # rough cosine->similarity
         matches.append(
             {
                 "item": meta,
                 "distance": float(dist),
-                "similarity": float(similarity),
+                "similarity": similarity,
             }
         )
-    # already sorted by distance
     return matches
 
 
 # =========================
-# CHAT STATE (LOST ITEM)
+# LOST-ITEM CHAT STATE
 # =========================
 
 QUESTIONS = [
@@ -211,22 +223,83 @@ def reset_session():
 
 
 # =========================
-# LAYOUT
+# PHOTO → CAPTION (OPTIONAL)
+# =========================
+
+st.markdown("## Lost & Found AI — Demo")
+st.markdown("Photo caption → Chat intake → Tag filter → Cosine ranking → Claims")
+
+photo_cols = st.columns([2, 3])
+
+with photo_cols[0]:
+    st.markdown("### Add a Photo (Optional)")
+    uploaded_photo = st.file_uploader(
+        "Photo → Auto Caption",
+        type=["jpg", "jpeg", "png"],
+        key="photo_uploader",
+    )
+
+    if st.button("Generate caption", disabled=(uploaded_photo is None)):
+        if not openai_client:
+            st.warning("No API key detected; cannot generate caption.")
+        elif not uploaded_photo:
+            st.warning("Please upload a photo first.")
+        else:
+            bytes_data = uploaded_photo.read()
+            with st.spinner("Generating caption..."):
+                try:
+                    resp = openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Describe this item briefly."},
+                                    {
+                                        "type": "image",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{bytes_data.hex()}",
+                                            "detail": "auto",
+                                        },
+                                    },
+                                ],
+                            }
+                        ],
+                        max_tokens=60,
+                    )
+                    caption = resp.choices[0].message.content.strip()
+                    st.session_state.photo_caption = caption
+                except Exception as e:
+                    st.error(f"Error generating caption: {e}")
+
+with photo_cols[1]:
+    st.markdown("### How it's used")
+    if st.session_state.photo_caption:
+        st.markdown(
+            "The generated caption is automatically prepended to your chat "
+            "description when we search for matches."
+        )
+        st.markdown(f"**Caption:** {st.session_state.photo_caption}")
+    else:
+        st.markdown(
+            "Upload an image and click **Generate caption**. "
+            "If you skip this step, only the text description from the chat "
+            "will be used."
+        )
+
+st.markdown("---")
+
+# =========================
+# TOP: CHAT + MATCHES
 # =========================
 
 top_cols = st.columns([3, 2])
 
-# ------------- LEFT: LOST ITEM CHAT -------------
+# ----- LEFT: LOST ITEM CHAT -----
 with top_cols[0]:
-    st.markdown("## Lost & Found AI — Demo")
-    st.markdown(
-        "Photo caption → Chat intake → Tag filter → Cosine ranking → Claims"
-    )
     st.markdown("### Describe Your Lost Item")
 
-    # show chat
     if not st.session_state.chat_history:
-        # initial system-style messages
         st.session_state.chat_history.append(
             {"role": "system", "text": "Hi! I’ll ask a few questions to describe your item."}
         )
@@ -242,33 +315,27 @@ with top_cols[0]:
             else:
                 st.markdown(msg["text"])
 
-    # user input box
-    user_input = st.text_input(
-        "", placeholder="Type here...", key="lost_item_input"
-    )
+    user_input = st.text_input("", placeholder="Type here...", key="lost_item_input")
 
     send_col, reset_col = st.columns([1, 1])
     with send_col:
         if st.button("Send", type="primary"):
             if user_input.strip():
-                # record answer
                 idx = st.session_state.question_idx
                 if idx < len(QUESTIONS):
-                    key = f"q{idx+1}"
-                    st.session_state.answers[key] = user_input.strip()
+                    st.session_state.answers[f"q{idx+1}"] = user_input.strip()
 
                 st.session_state.chat_history.append(
                     {"role": "user", "text": user_input.strip()}
                 )
 
-                # move to next question or finalize
                 if idx + 1 < len(QUESTIONS):
                     st.session_state.question_idx += 1
                     st.session_state.chat_history.append(
                         {"role": "system", "text": QUESTIONS[idx + 1]}
                     )
                 else:
-                    # build final description
+                    # final summary
                     parts = []
                     kind = st.session_state.answers.get("q1", "")
                     color = st.session_state.answers.get("q2", "")
@@ -293,8 +360,6 @@ with top_cols[0]:
                             "text": f"Thanks! Here is the summary of your item:\n\n> {final_desc}",
                         }
                     )
-
-                    # clear input
                 st.session_state.lost_item_input = ""
                 st.experimental_rerun()
 
@@ -303,21 +368,22 @@ with top_cols[0]:
             reset_session()
             st.experimental_rerun()
 
-# ------------- RIGHT: MATCHES -------------
+# ----- RIGHT: MATCH RESULTS -----
 with top_cols[1]:
     st.markdown("### Match threshold")
-    threshold = st.slider(
-        "", min_value=0, max_value=100, value=20, step=5, format="%d%%"
-    )
+    threshold = st.slider("", 0, 100, 20, 5, format="%d%%")
 
     st.markdown("### Top Matches")
 
     if st.session_state.final_description and embedder:
-        matches = find_matches(
-            st.session_state.final_description, top_k=5
-        )
+        # prepend caption if it exists
+        query_text = st.session_state.final_description
+        if st.session_state.photo_caption:
+            query_text = f"{st.session_state.photo_caption}. {query_text}"
 
+        matches = find_matches(query_text, top_k=5)
         shown = False
+
         for m in matches:
             sim_pct = int(m["similarity"] * 100)
             if sim_pct < threshold:
@@ -330,22 +396,19 @@ with top_cols[1]:
                     f"**{item['title']}**  —  similarity: `{sim_pct}%`"
                 )
                 st.write(item.get("description", ""))
-                tags = []
+                chips = []
                 if item.get("location"):
-                    tags.append(f"location: {item['location']}")
+                    chips.append(f"location: {item['location']}")
                 if item.get("color"):
-                    tags.append(f"color: {item['color']}")
+                    chips.append(f"color: {item['color']}")
                 if item.get("category"):
-                    tags.append(f"category: {item['category']}")
+                    chips.append(f"category: {item['category']}")
                 if item.get("material"):
-                    tags.append(f"material: {item['material']}")
-
-                if tags:
-                    st.caption(" • ".join(tags))
-
+                    chips.append(f"material: {item['material']}")
+                if chips:
+                    st.caption(" • ".join(chips))
                 if item.get("time_found"):
                     st.caption(f"found: {item['time_found']}")
-
                 if item.get("image_url"):
                     st.image(item["image_url"], use_column_width=True)
 
@@ -374,7 +437,10 @@ with bottom_cols[0]:
         color = st.text_input("Color (optional)")
         category = st.text_input("Category (optional)")
         material = st.text_input("Material (optional)")
-        description = st.text_area("Short description")
+
+        # if we already have a photo caption, we can reuse as default description seed
+        default_desc = st.session_state.photo_caption or ""
+        description = st.text_area("Short description", value=default_desc)
 
         submitted = st.form_submit_button("Save Item")
 
@@ -401,12 +467,10 @@ with bottom_cols[0]:
 
             st.success("Item saved to inventory and indexed for matching.")
 
-    # Optional dev button to rebuild vector DB
     if st.checkbox("Rebuild vector DB from inventory (dev tool)"):
         if st.button("Rebuild now"):
             rebuild_chroma_from_inventory()
             st.success("Rebuilt Chroma index from current inventory.")
-
 
 with bottom_cols[1]:
     st.markdown("### Inventory")
@@ -414,20 +478,19 @@ with bottom_cols[1]:
     if not st.session_state.inventory:
         st.write("No items saved yet.")
     else:
-        # latest first
         for item in reversed(st.session_state.inventory):
             with st.container(border=True):
                 if item.get("image_url"):
                     st.image(item["image_url"], use_column_width=True)
 
                 st.markdown(f"**{item['title']}**")
-                subtitle_parts = []
+                subtitle = []
                 if item.get("location"):
-                    subtitle_parts.append(item["location"])
+                    subtitle.append(item["location"])
                 if item.get("time_found"):
-                    subtitle_parts.append(item["time_found"])
-                if subtitle_parts:
-                    st.caption(" · ".join(subtitle_parts))
+                    subtitle.append(item["time_found"])
+                if subtitle:
+                    st.caption(" · ".join(subtitle))
 
                 st.write(item.get("description", ""))
 
