@@ -77,12 +77,14 @@ def get_engine():
         st.error("PG_CONNECTION_STRING is not set in Streamlit secrets.")
         return None
     try:
-        engine = create_engine(secrets["pg_conn_string"])
+        engine = create_engine(
+            secrets["pg_conn_string"],
+            pool_pre_ping=True,   # <--- ADD THIS HERE
+        )
         return engine
     except SQLAlchemyError as e:
         st.error(f"Error creating PostgreSQL engine: {e}")
         return None
-
 
 engine = get_engine()
 
