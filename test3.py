@@ -451,12 +451,63 @@ def get_next_found_id() -> int:
     st.session_state.next_found_id += 1
     return nid
 
-
 def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     """
     Add a found item into Chroma vector DB with metadata.
     Returns a local numeric ID.
     """
+    if vector_store is None:
+        st.error("Vector store is not available; cannot save found item.")
+        return -1
+
+    description = json_data.get("description", "")
+    if not description:
+        st.error("Found item description is empty; cannot embed.")
+        return -1
+
+    found_id = get_next_found_id()
+
+    # --- CRITICAL FIX: Flatten lists to strings ---
+    # ChromaDB metadata CANNOT hold lists like []. 
+    # We must convert them to strings like "null" or "Blue, Red".
+    def flatten(v):
+        if isinstance(v, list):
+            if not v:
+                return "null"
+            return ", ".join(str(x) for x in v)
+        return str(v) if v is not None else "null"
+
+    metadata = {
+        "record_type": "found",
+        "found_id": found_id,
+        "subway_location": flatten(json_data.get("subway_location", [])),
+        "color": flatten(json_data.get("color", [])),
+        "item_category": flatten(json_data.get("item_category", "")),
+        "item_type": flatten(json_data.get("item_type", [])),
+        "description": description,
+        "contact": contact,
+        "time": json_data.get("time", ""),
+    }
+    # ---------------------------------------------
+
+    try:
+        vector_store.add_texts(
+            texts=[description],
+            metadatas=[metadata],
+            ids=[str(found_id)],
+        )
+        return found_id
+    except Exception as e:
+        st.error(f"Error saving found item to vector store: {e}")
+        return -1
+
+
+"""
+def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
+    
+    #Add a found item into Chroma vector DB with metadata.
+    #Returns a local numeric ID.
+    
     if vector_store is None:
         st.error("Vector store is not available; cannot save found item.")
         return -1
@@ -491,15 +542,90 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     except Exception as e:
         st.error(f"Error saving found item to vector store: {e}")
         return -1
-
-
+"""
+  
 def search_matches_for_lost_item(
     final_json: Dict, top_k: int, max_distance: float
 ) -> Tuple[List[Any], List[Any]]:
     """
+    1. Pre-filter by Category/Type (Exact) and Location (Contains).
+    2. Vector search for description similarity.
+    3. Filter by distance threshold.
+    """
+    if vector_store is None:
+        return [], []
+
+    query_text = final_json.get("description", "")
+    if not query_text:
+        return [], []
+
+    # --- 1. BUILD THE "SQL" FILTERS ---
+    # We start with the base requirement: it must be a 'found' item.
+    where_clauses = [{"record_type": {"$eq": "found"}}]
+
+    # Helper to get the first string from a potential list
+    def get_first_val(val):
+        if isinstance(val, list):
+            return val[0] if len(val) > 0 else None
+        return val
+
+    # A. SUBWAY LOCATION (Use $contains logic)
+    # If user says "Penn Station", we match "Penn Station" OR "Line A, Penn Station"
+    loc_val = get_first_val(final_json.get("subway_location"))
+    if loc_val and loc_val != "null":
+        where_clauses.append({"subway_location": {"$contains": loc_val}})
+
+    # B. ITEM CATEGORY (Exact match)
+    cat_val = get_first_val(final_json.get("item_category"))
+    if cat_val and cat_val != "null":
+        where_clauses.append({"item_category": {"$eq": cat_val}})
+
+    # C. ITEM TYPE (Exact match)
+    type_val = get_first_val(final_json.get("item_type"))
+    if type_val and type_val != "null":
+        where_clauses.append({"item_type": {"$eq": type_val}})
+
+    # D. COLOR (Exact match) - Optional
+    # Color is tricky because "Dark Blue" != "Blue". 
+    # Enable this only if your standardizer is very consistent.
+    # color_val = get_first_val(final_json.get("color"))
+    # if color_val and color_val != "null":
+    #     where_clauses.append({"color": {"$eq": color_val}})
+
+    # --- 2. COMPILE FILTER DICTIONARY ---
+    # Chroma syntax requires "$and": [list of dicts] if multiple conditions exist
+    if len(where_clauses) > 1:
+        filter_dict = {"$and": where_clauses}
+    else:
+        filter_dict = where_clauses[0]
+
+    # --- 3. EXECUTE SEARCH ---
+    try:
+        # Pass the strict filter_dict to the vector store
+        docs_scores = vector_store.similarity_search_with_score(
+            query_text,
+            k=top_k,
+            filter=filter_dict,
+        )
+    except Exception as e:
+        # Fallback: sometimes if the filter is too strict (returns 0 results),
+        # or if metadata types don't match, Chroma might throw an error.
+        st.warning(f"Search warning (relaxing filters might help): {e}")
+        docs_scores = []
+
+    # --- 4. POST-FILTER BY DISTANCE ---
+    filtered = [(doc, score) for doc, score in docs_scores if score <= max_distance]
+    
+    return docs_scores, filtered
+
+"""
+def search_matches_for_lost_item(
+    final_json: Dict, top_k: int, max_distance: float
+) -> Tuple[List[Any], List[Any]]:
+    
     Use vector DB (Chroma) to search for similar found items.
     Returns (all_candidates, filtered_by_distance)
-    """
+    
     if vector_store is None:
         return [], []
 
@@ -524,7 +650,7 @@ def search_matches_for_lost_item(
 
     filtered = [(doc, score) for doc, score in docs_scores if score <= max_distance]
     return docs_scores, filtered
-
+"""
 
 # -----------------------
 # APP INIT
@@ -637,7 +763,42 @@ if page.startswith("👮"):
                     placeholder="For example: black backpack with a NASA patch",
                     key="operator_text",
                 )
+        if st.button("🚀 Start Intake"):
+            if not uploaded_image and not initial_text:
+                st.error("Please upload an image or enter a short description.")
+            else:
+                # 1. Create a list to hold the content parts
+                message_parts = [] 
+                
+                if uploaded_image:
+                    # 2. Open the image and APPEND THE ACTUAL OBJECT to the list
+                    img = Image.open(uploaded_image).convert("RGB")
+                    st.image(img, width=220, caption="Preview of found item")
+                    message_parts.append(img) 
+                    message_parts.append("I have uploaded an image of the found item.")
+                
+                if initial_text:
+                    message_parts.append(initial_text)
 
+                # 3. Add to history (we only store text in history for display, 
+                # or you can store a placeholder string for the image)
+                st.session_state.operator_msgs.append(
+                    {"role": "user", "content": " ".join([str(p) for p in message_parts if isinstance(p, str)]) or "[Image Uploaded]"}
+                )
+                
+                with st.spinner("Analyzing item with Gemini..."):
+                    # 4. Send the LIST (message_parts) to Gemini, not just the string
+                    response = safe_send(
+                        st.session_state.operator_chat,
+                        message_parts, 
+                        context="operator intake",
+                    )
+                
+                st.session_state.operator_msgs.append(
+                    {"role": "model", "content": response.text}
+                )
+                st.rerun()
+        """
         if st.button("🚀 Start Intake"):
             if not uploaded_image and not initial_text:
                 st.error("Please upload an image or enter a short description.")
@@ -663,7 +824,7 @@ if page.startswith("👮"):
                     {"role": "model", "content": response.text}
                 )
                 st.rerun()
-
+        """
     # Continue chat
     operator_input = st.chat_input("Add more details for the operator bot, or say 'done' when ready.")
     if operator_input:
@@ -707,8 +868,8 @@ if page.startswith("👮"):
 # PAGE 2: USER – REPORT LOST ITEM & MATCH
 # ===============================================================
 
-if page.startswith("👤"):
-    st.markdown('<div class="main-title">👤 User View: Report Lost Item</div>', unsafe_allow_html=True)
+if page.startswith("🧍"):
+    st.markdown('<div class="main-title">🧍 User View: Report Lost Item</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="subtitle">Riders describe what they lost. The system standardizes their description '
         'and searches for similar found items using embeddings.</div>',
@@ -768,6 +929,40 @@ if page.startswith("👤"):
         if not uploaded_image and not initial_text:
             st.error("Please upload an image or enter a short description.")
         else:
+            # 1. Create a list for content parts
+            message_parts = []
+            
+            if uploaded_image:
+                image = Image.open(uploaded_image).convert("RGB")
+                st.image(image, width=240, caption="Your lost item (preview)")
+                # 2. Append the ACTUAL IMAGE OBJECT
+                message_parts.append(image)
+                message_parts.append("I have uploaded an image of my lost item.")
+            
+            if initial_text:
+                message_parts.append(initial_text)
+
+            st.session_state.user_msgs.append(
+                {"role": "user", "content": " ".join([str(p) for p in message_parts if isinstance(p, str)]) or "[Image Uploaded]"}
+            )
+            
+            with st.spinner("Analyzing your description..."):
+                # 3. Send the LIST
+                response = safe_send(
+                    st.session_state.user_chat,
+                    message_parts, 
+                    context="user initial report",
+                )
+            
+            st.session_state.user_msgs.append(
+                {"role": "model", "content": response.text}
+            )
+            st.rerun()
+    """
+    if not st.session_state.user_msgs and st.button("🚀 Start Lost Item Report"):
+        if not uploaded_image and not initial_text:
+            st.error("Please upload an image or enter a short description.")
+        else:
             message_text = ""
             if uploaded_image:
                 image = Image.open(uploaded_image).convert("RGB")
@@ -789,7 +984,7 @@ if page.startswith("👤"):
                 {"role": "model", "content": response.text}
             )
             st.rerun()
-
+    """
     # Continue chat
     user_input = st.chat_input("Add more details, answer questions, or say 'done' when ready.")
     if user_input:
