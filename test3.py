@@ -771,7 +771,7 @@ if page.startswith("👮"):
             st.json(final_json)
 
             st.markdown('<div class="section-title">👮 Operator Contact</div>', unsafe_allow_html=True)
-            contact = st.text_input("Operator contact or badge ID")
+            contact = st.text_input("Operator Contact or Badge ID")
 
             if st.button("💾 Save Found Item to Database"):
                 saved_file = st.session_state.get("current_upload", None)
@@ -846,37 +846,49 @@ if page.startswith("👤"):
             st.markdown(msg["content"])
 
     # Start report
+
     if not st.session_state.user_msgs and st.button("🚀 Start Lost Item Report"):
         if not uploaded_image and not initial_text:
             st.error("Please upload an image or enter a short description.")
         else:
-            # 1. Create a list for content parts
+            # 1. Create list for content
             message_parts = []
             
+            # 2. Add Image
             if uploaded_image:
                 image = Image.open(uploaded_image).convert("RGB")
                 st.image(image, width=240, caption="Your lost item (preview)")
-                # 2. Append the ACTUAL IMAGE OBJECT
                 message_parts.append(image)
                 message_parts.append("I have uploaded an image of my lost item.")
             
+            # 3. Add Text Input
             if initial_text:
-                message_parts.append(initial_text)
+                message_parts.append(f"User Description: {initial_text}")
+
+            # 4. Inject Dropdowns
+            if location_choice:
+                message_parts.append(f"I lost this item at subway station: {location_choice}.")
+            
+            if category_choice:
+                message_parts.append(f"The item category is: {category_choice}.")
+                
+            if type_choice:
+                message_parts.append(f"The specific item type is: {type_choice}.")
 
             st.session_state.user_msgs.append(
                 {"role": "user", "content": " ".join([str(p) for p in message_parts if isinstance(p, str)]) or "[Image Uploaded]"}
             )
             
             with st.spinner("Analyzing your description..."):
-                # 3. Send the LIST
                 response = safe_send(
                     st.session_state.user_chat,
                     message_parts, 
                     context="user initial report",
                 )
             
+            model_text = response.text if response.text else ""
             st.session_state.user_msgs.append(
-                {"role": "model", "content": response.text}
+                {"role": "model", "content": model_text}
             )
             st.rerun()
     
@@ -919,8 +931,8 @@ Description: {extract_field(structured_text, 'Description')}
             st.json(final_json)
 
             st.markdown('<div class="section-title">📇 Contact Information</div>', unsafe_allow_html=True)
-            contact = st.text_input("Phone number (10 digits, numbers only)")
-            email = st.text_input("Email address")
+            contact = st.text_input("Phone Number (10 digits, numbers only)")
+            email = st.text_input("Email Address")
 
             st.info("Your contact is only used to follow up if a strong match is found.")
 
