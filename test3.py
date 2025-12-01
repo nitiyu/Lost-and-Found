@@ -705,6 +705,9 @@ if page.startswith("👮"):
             if not uploaded_image and not initial_text:
                 st.error("Please upload an image or enter a short description.")
             else:
+                if uploaded_image:
+                    st.session_state.current_upload = uploaded_image
+
                 # 1. Create a list to hold the content parts
                 message_parts = [] 
                 
@@ -771,15 +774,16 @@ if page.startswith("👮"):
             contact = st.text_input("Operator contact or badge ID")
 
             if st.button("💾 Save Found Item to Database"):
+                saved_file = st.session_state.get("current_upload", None)
+                
                 found_id = save_found_item_to_vectorstore(
                     final_json, 
                     contact, 
-                    image_file=uploaded_image
+                    image_file=saved_file  
                 )
                 
                 if found_id > 0:
                     st.success(f"Found item saved with ID `{found_id}`.")
-
 
 # ===============================================================
 # PAGE 2: USER – REPORT LOST ITEM & MATCH
@@ -962,10 +966,11 @@ Description: {extract_field(structured_text, 'Description')}
                                 meta = doc.metadata or {}
                                 similarity_pct = max(0.0, (1.0 - score) * 100.0)
 
-                                st.markdown(
-                                    f"**Distance:** `{score:.4f}`  ·  "
-                                    f"**Similarity (approx):** `{similarity_pct:.1f}%`"
-                                )
+                                st.markdown(f"**Similarity:** `{similarity_pct:.1f}%`")
+                                
+                                img_path = meta.get("image_path")
+                                if img_path and img_path != "null" and os.path.exists(img_path):
+                                    st.image(img_path, width=200, caption="Found Item Photo")
 
                                 st.write("**Description:**", meta.get("description", doc.page_content))
 
