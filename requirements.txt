@@ -1,9 +1,8 @@
 streamlit
-google-genai
 pandas
-Pillow
-sqlalchemy
-psycopg2-binary
-langchain-community
+openpyxl
 langchain-openai
-pgvector
+langchain-community
+chromadb==0.5.3
+google-genai
+Pillow
