@@ -974,16 +974,14 @@ Description: {extract_field(structured_text, 'Description')}
 
                                 st.write("**Description:**", meta.get("description", doc.page_content))
 
-                                if meta.get("subway_location"):
-                                    st.write(
-                                        "🚉 Location:", ", ".join(meta["subway_location"])
-                                    )
-                                if meta.get("color"):
-                                    st.write("🎨 Color:", ", ".join(meta["color"]))
-                                if meta.get("item_category"):
+                                if meta.get("subway_location") and meta["subway_location"] != "null":
+                                    st.write("🚉 Location:", meta["subway_location"])
+                                if meta.get("color") and meta["color"] != "null":
+                                    st.write("🎨 Color:", meta["color"])
+                                if meta.get("item_category") and meta["item_category"] != "null":
                                     st.write("📂 Category:", meta["item_category"])
-                                if meta.get("item_type"):
-                                    st.write("🔖 Type:", ", ".join(meta["item_type"]))
+                                if meta.get("item_type") and meta["item_type"] != "null":
+                                    st.write("🔖 Type:", meta["item_type"])
 
                                 st.caption(f"Found item ID: {meta.get('found_id', 'N/A')} · Time: {meta.get('time', '')}")
                                 with st.expander("View raw metadata"):
